@@ -1,0 +1,617 @@
+---
+title: "RPS_Exeriment"
+format: html
+editor: visual
+---
+
+## Introduction
+
+ELO is a popular rating system to use an IRT model to rate players, but includes a major transitivity assumption. $P(win | \theta_i, \theta_j)$
+
+## Rock-Paper-Scissors IRT Experiment
+
+```{r}
+library(tidyverse)
+library(future.apply)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+```
+
+## Simple ELO model
+
+```{r}
+## Simulating the game data
+N_ids <- 100
+N_games <- 5000
+elo_thetas <- rnorm(N_ids)
+
+simulate_game <- function(thetas){
+  t_ids <- sample(c(1:length(thetas)),2,replace=FALSE)
+  t <- thetas[t_ids]
+  dt <- t[1]-t[2]
+  p <- 1/(1+exp(-dt))
+  w <- rbinom(n=1,size=1,prob=p)
+  res <- c(t_ids[1],t_ids[2],w)
+  return(res)
+}
+
+
+elo_matches <- as.data.frame(do.call(rbind, replicate(N_games,simulate_game(elo_thetas),simplify = FALSE)))
+
+elo_matches <- elo_matches |> rename(player1="V1",
+                             player2="V2",
+                             result="V3")
+```
+
+### Fitting ELO Model
+
+```{r}
+LogLikMatch <- function(data, theta) {
+  p <- plogis(theta[data$player1] - theta[data$player2])
+  ll <- sum(data$result * log(p) + (1 - data$result) * log(1 - p))
+  return(ll)
+}
+
+starting_theta <- rnorm(N_ids)
+
+sol <- optim(
+  starting_theta,
+  LogLikMatch,
+  data = elo_matches,
+  method = 'L-BFGS-B',
+  lower = -3,
+  upper = 3,
+  control = list(fnscale = -1, maxit = 1e6)
+)
+
+cor(sol$par, elo_thetas)
+plot(sol$par, elo_thetas)
+
+```
+
+## Simulating RPS
+
+```{r}
+## Simulating the game data
+set.seed(1729)
+N_ids <- 100
+N_games <- 1000
+N_opts <- 3 ## For rock-paper-scissors
+rps_thetas <- rep(0,N_ids)
+
+rps_winner <- function(x,y,N_opts){
+  a <- min(x,y)
+  b <- max(x,y)
+  if(a==1 & b==N_opts){
+    return(a)
+  }else{
+    return(b)
+  }
+}
+
+simulate_rps <- function(thetas,N_opts){
+  t_ids <- sample(c(1:length(thetas)),2,replace=FALSE)
+  h <- sample(c(1:N_opts),2,replace=FALSE)
+  h_win <- rps_winner(h[1],h[2],N_opts)
+  w <- ifelse(h_win==h[1],1,0)
+  res <- c(t_ids[1],t_ids[2],h[1],h[2],w)
+  return(res)
+}
+
+
+rps_matches <- as.data.frame(do.call(rbind, replicate(N_games,simulate_rps(rps_thetas,N_opts),simplify = FALSE)))
+
+rps_matches <- rps_matches |> rename(player1="V1",
+                             player2="V2",
+                             hand1 = "V3",
+                             hand2 = "V4",
+                             result="V5")
+```
+
+```{r}
+LogLik_RPS <- function(data, params, N_ids) {
+  theta <- params[1:N_ids]
+  phi <- c(0,params[(N_ids+1):length(params)])
+  d_theta <- theta[data$player1] - theta[data$player2]
+  # forcing d_theta to be 0
+  # d_theta <- 0
+  d_phi <- phi[data$hand1] - phi[data$hand2]
+  c <- (1+d_theta)*(1+2*atanh(sinpi(d_phi)))-1
+  # c <- (1+d_theta)*(1+log((1+sinpi(d_phi))/(1-sinpi(d_phi))))
+  p <- plogis(c)
+  ll <- sum(data$result * log(p) + (1 - data$result) * log(1 - p))
+  return(ll)
+}
+
+estimate_nt_elo <- function(N_ids,N_opts,rps_matches,starting_phi){
+  starting_theta <- rnorm(N_ids)
+  starting_phi <- starting_phi
+  
+  # starting_phi <- (c(1:N_opts)-1)*2/N_opts
+  # starting_phi <- sample(starting_phi,N_opts,FALSE)
+  
+  starting_params <- c(starting_theta,starting_phi)
+  
+  sol <- optim(
+    starting_params,
+    LogLik_RPS,
+    data = rps_matches,
+    N_ids = N_ids,
+    method = 'CG',
+    # lower = -3,
+    # upper = 3,
+    control = list(fnscale = -1,
+                   maxit = 1e6
+  ))
+  
+  return(list(sol=sol,starting_phi=starting_phi))
+}
+
+starting_phi <- runif(N_opts-1,min=0,max=2)
+res <- estimate_nt_elo(N_ids, N_opts, rps_matches,starting_phi)
+sol <- res$sol
+starting_phi <- res$starting_phi
+
+
+```
+
+### Visualizing the results
+
+```{r}
+est_theta <- as.data.frame(list(est=sol$par[1:N_ids],
+                  true=rps_thetas))
+est_phi <- as.data.frame(list(est=c(0,sol$par[(N_ids+1):length(sol$par)]),
+                r=rep(1,N_opts),
+                type=rep("est",N_opts),
+                id=c(1:N_opts)))
+start_phi <- as.data.frame(list(est=c(0,starting_phi),
+                r=rep(1,N_opts),
+                type=rep("init",N_opts),
+                id=c(1:N_opts)))
+
+est_phi <- rbind(est_phi,start_phi)
+
+est_phi <- est_phi |> mutate(phi=pi*(est%%2))
+
+est_theta_mu <- round(mean(est_theta$est),2)
+est_theta_var <- round(sd(est_theta$est)^2,3)
+
+p_phi <- ggplot(est_phi) +
+  geom_point(aes(r, phi,color=factor(id),shape=factor(type))) + 
+  coord_radial(theta="y",
+               start=pi/2,
+               direction=-1,
+               rlim=c(0,1),
+               thetalim = c(0,2*pi)) +
+  ggtitle("Est. Phi") +
+  labs(color = "Hand",shape="") +
+  scale_color_discrete(labels = c("Rock", "Paper", "Scissors"))
+
+p_theta <- ggplot(est_theta,aes(x=true,y=est)) + 
+  geom_point() + 
+  theme_bw() +
+  ggtitle(paste0("Est. Theta ~ N(",est_theta_mu,",",est_theta_var,")"))
+
+p_theta | p_phi
+```
+
+#### Checking model fit stability
+
+Simulating 1000 times to check how often the model fit fails or returns degenerate results. Takes some time to run.
+
+```{r}
+
+plan(multisession, workers = parallel::detectCores() - 1)
+
+set.seed(1729)
+N_sim <- 1e2
+N_ids <- 100
+N_games <- 1000
+N_opts <- 3 
+
+run_single_sim <- function(i, N_ids, N_games, N_opts) {
+
+  rps_thetas <- rep(0, N_ids)
+  
+  rps_matches <- as.data.frame(do.call(rbind, 
+                                       replicate(N_games,
+                                                 simulate_rps(rps_thetas, N_opts),
+                                                 simplify = FALSE)))
+  
+  colnames(rps_matches) <- c("player1", "player2", "hand1", "hand2", "result")
+  
+  starting_phi <- runif(N_opts-1,min=0,max=2)
+  sol <- try(estimate_nt_elo(N_ids, N_opts, rps_matches, starting_phi)$sol, silent = TRUE)
+  
+  if (inherits(sol, "try-error")) {
+    return(list(phi = NULL, theta = NULL, starting_phi=starting_phi))
+  } else {
+    # Process phi
+    est_phi <- data.frame(
+      est = c(0, sol$par[(N_ids + 1):length(sol$par)]),
+      r = 1,
+      id = 1:N_opts
+    ) %>% mutate(phi = pi * (est %% 2))
+    
+    # Process theta
+    est_theta_pars <- data.frame(
+      mean = mean(sol$par[1:N_ids]),
+      var = var(sol$par[1:N_ids])
+    )
+    
+    return(list(phi = est_phi, theta = est_theta_pars, starting_phi=starting_phi))
+  }
+}
+
+
+results <- future_lapply(1:N_sim, run_single_sim, 
+                         N_ids = N_ids, N_games = N_games, N_opts = N_opts, 
+                         future.seed = TRUE)
+
+check_res <- function(res){
+  return(is.null(res$phi))
+}
+
+successful_results <- results[!sapply(results, check_res)]
+failures <- N_sim - length(successful_results)
+
+est_phi_sim <- bind_rows(lapply(successful_results, `[[`, "phi"))
+est_theta_sim <- bind_rows(lapply(successful_results, `[[`, "theta"))
+starting_phi_sim <- c(lapply(results, `[[`, "starting_phi"))
+
+print(paste0("% optimization fails: ", round(100 * failures / N_sim, 2)))
+```
+
+```{r}
+p_phi <- ggplot(est_phi_sim) +
+  geom_point(aes(r, phi,color=factor(id)),alpha=0.5) + 
+  coord_radial(theta="y",
+               start=pi/2,
+               direction=-1,
+               rlim=c(0,1),
+               thetalim = c(0,2*pi)) +
+  ggtitle("Est. Phis") +
+  labs(color = "Hand") +
+  scale_color_discrete(labels = c("Rock", "Paper", "Scissors"))
+
+p_theta <- ggplot(est_theta_sim,aes(x=mean,y=var)) + 
+  geom_point() + 
+  theme_bw() +
+  ggtitle(paste0("Est. Thetas ~ N(Mean,Var)"))
+
+p_theta | p_phi
+```
+
+Investigating cases with failures
+
+-   Bad starting conditions: Seems to work for a different simulation of matches with these starting params
+
+-   Cases we get poor Phi estimates
+
+```{r}
+failed_fit_ids <- sapply(results, check_res)
+failed_starting_phis <- starting_phi_sim[failed_fit_ids]
+
+for(i in c(1:length(failed_starting_phis))){
+  res <- try(estimate_nt_elo(N_ids, N_opts, rps_matches,failed_starting_phis[[i]]),
+             silent = TRUE)  
+  print(res)
+}
+
+
+
+```
+
+Check optim output for weird cases for convergence warnings
+
+Start at the "right answer" and see if things still diverge
+
+## Simulating RPS with individual "luck" (ability)
+
+```{r}
+## Simulating the game data
+set.seed(1729)
+N_ids <- 100
+N_games <- 5000
+N_opts <- 3 ## For rock-paper-scissors
+rps_luck_thetas <- rnorm(N_ids)
+
+rps_winner <- function(x,y,N_opts){
+  a <- min(x,y)
+  b <- max(x,y)
+  if(a==1 & b==N_opts){
+    return(a)
+  }else{
+    return(b)
+  }
+}
+
+simulate_rps_luck <- function(thetas,N_opts){
+  t_ids <- sample(c(1:length(thetas)),2,replace=FALSE)
+  rps_wins <- list(c(2,1),c(3,2),c(1,3))
+  h <- sample(rps_wins,1)[[1]]
+  ## Luckier player to win
+  dt <- thetas[t_ids[1]] - thetas[t_ids[2]]
+  w <- rbinom(1,1,plogis(dt))
+  if(w==0){
+    h <- c(h[2],h[1])
+  }
+  res <- c(t_ids[1],t_ids[2],h[1],h[2],w)
+  return(res)
+}
+
+
+rps_matches <- as.data.frame(do.call(rbind, replicate(N_games,simulate_rps_luck(rps_luck_thetas,N_opts),simplify = FALSE)))
+
+rps_matches <- rps_matches |> rename(player1="V1",
+                             player2="V2",
+                             hand1 = "V3",
+                             hand2 = "V4",
+                             result="V5")
+```
+
+```{r}
+starting_theta <- rnorm(N_ids)
+# starting_phi <- runif(N_opts-1,min=0,max=2)
+starting_phi <- rep(0.25,N_opts-1)
+
+
+
+starting_params <- c(starting_theta,starting_phi)
+
+sol <- optim(
+  starting_params,
+  LogLik_RPS,
+  data = rps_matches,
+  N_ids = N_ids,
+  method = 'CG',
+  # lower = -3,
+  # upper = 3,
+  control = list(fnscale = -1,
+                 maxit = 1e6
+))
+
+est_theta <- as.data.frame(list(est=sol$par[1:N_ids],
+                  true=rps_luck_thetas))
+est_phi <- as.data.frame(list(est=c(0,sol$par[(N_ids+1):length(sol$par)]),
+                r=rep(1,N_opts),
+                type=rep("est",N_opts),
+                id=c(1:N_opts)))
+start_phi <- as.data.frame(list(est=c(0,starting_phi),
+                r=rep(1,N_opts),
+                type=rep("init",N_opts),
+                id=c(1:N_opts)))
+
+est_phi <- rbind(est_phi,start_phi)
+
+est_phi <- est_phi |> mutate(phi=pi*(est%%2))
+
+est_theta_mu <- round(mean(est_theta$est),2)
+est_theta_var <- round(var(est_theta$est),3)
+
+p_phi <- ggplot(est_phi) +
+  geom_point(aes(r, phi,color=factor(id),shape=factor(type))) + 
+  coord_radial(theta="y",
+               start=pi/2,
+               direction=-1,
+               rlim=c(0,1),
+               thetalim = c(0,2*pi)) +
+  ggtitle("Est. Phi") +
+  labs(color = "Hand",shape="") +
+  scale_color_discrete(labels = c("Rock", "Paper", "Scissors"))
+
+r_value <- round(cor(est_theta$est,est_theta$true),2)
+p_theta <- ggplot(est_theta,aes(x=true,y=est)) + 
+  geom_point() + 
+  annotate("text", x = 2, y = -0.2, label = paste("r =", r_value)) +
+  theme_bw() +
+  ggtitle(paste0("Est. Theta ~ N(",est_theta_mu,",",est_theta_var,")"))
+
+p_theta | p_phi
+```
+
+Simulating 1000 times to check model fit stability. Takes a long time to run.
+
+```{r}
+
+plan(multisession, workers = parallel::detectCores() - 1)
+
+set.seed(1729)
+N_sim <- 1e4
+N_ids <- 100
+N_games <- 1000
+N_opts <- 3 
+
+
+run_single_sim <- function(i, N_ids, N_games, N_opts) {
+  
+  rps_luck_thetas <- rnorm(N_ids)
+  
+  rps_matches <- as.data.frame(do.call(rbind, 
+                                       replicate(N_games,
+                                                 simulate_rps_luck(rps_luck_thetas, N_opts),
+                                                 simplify = FALSE)))
+  
+  colnames(rps_matches) <- c("player1", "player2", "hand1", "hand2", "result")
+  
+  sol <- try(estimate_nt_elo(N_ids, N_opts, rps_matches)$sol
+             , silent = TRUE)
+  
+  if (inherits(sol, "try-error")) {
+    return(NULL) # Indicate a failure
+  } else {
+    # Process phi
+    est_phi <- data.frame(
+      est = c(0, sol$par[(N_ids + 1):length(sol$par)]),
+      r = 1,
+      id = 1:N_opts
+    ) %>% mutate(phi = pi * (est %% 2))
+    
+    # Process theta
+    est_theta_pars <- data.frame(
+      mean = mean(sol$par[1:N_ids]),
+      var = var(sol$par[1:N_ids]),
+      cor = cor(sol$par[1:N_ids],rps_luck_thetas)
+    )
+    
+    return(list(phi = est_phi, theta = est_theta_pars))
+  }
+}
+
+results <- future_lapply(1:N_sim, run_single_sim, 
+                         N_ids = N_ids, N_games = N_games, N_opts = N_opts, 
+                         future.seed = TRUE)
+
+successful_results_luck <- results[!sapply(results, is.null)]
+failures_luck <- N_sim - length(successful_results)
+
+est_phi_sim_luck <- bind_rows(lapply(successful_results_luck, `[[`, "phi"))
+est_theta_sim_luck <- bind_rows(lapply(successful_results_luck, `[[`, "theta"))
+
+print(paste0("% optimization fails: ", round(100 * failures_luck / N_sim, 2)))
+```
+
+```{r}
+p_phi <- ggplot(est_phi_sim_luck) +
+  geom_point(aes(r, phi,color=factor(id)),alpha=0.5) + 
+  coord_radial(theta="y",
+               start=pi/2,
+               direction=-1,
+               rlim=c(0,1),
+               thetalim = c(0,2*pi)) +
+  ggtitle("Est. Phis") +
+  labs(color = "Hand") +
+  scale_color_discrete(labels = c("Rock", "Paper", "Scissors"))
+
+p_theta <- ggplot(est_theta_sim_luck,aes(x=mean,y=var)) + 
+  geom_point() + 
+  theme_bw() +
+  ggtitle(paste0("Est. Thetas ~ N(Mean,Var)"))
+
+p_theta | p_phi
+```
+
+## Generalized case
+
+Each player employs a different strategy (pick RPS with varying probabilities) facing each other in a game
+
+```{r}
+## Simulating the game data
+set.seed(1729)
+N_ids <- 5e2
+N_games <- 1e4
+N_opts <- 3 ## For rock-paper-scissors
+rps_thetas <- list()
+
+for(i in c(1:N_ids)){
+  theta <- runif(3)
+  theta <- theta/sum(theta)
+  rps_thetas[[i]] <- theta
+}
+
+rps_winner <- function(x,y,N_opts){
+  a <- min(x,y)
+  b <- max(x,y)
+  if(a==1 & b==N_opts){
+    return(a)
+  }else{
+    return(b)
+  }
+}
+
+simulate_rps <- function(thetas,N_opts){
+  t_ids <- sample(c(1:length(thetas)),2,replace=FALSE)
+  h1 <- 0
+  h2 <- 0
+  while(h1 == h2){
+    h1 <- sample(x=c(1:N_opts),size=1,prob=thetas[[t_ids[1]]]) #player 1 hand 
+    h2 <- sample(x=c(1:N_opts),size=1,prob=thetas[[t_ids[2]]]) #player 2 hand   
+  }
+  
+  h_win <- rps_winner(h1,h2,N_opts)
+  w <- ifelse(h_win==h1,1,0)
+  res <- c(t_ids[1],t_ids[2],h1,h2,w)
+  return(res)
+}
+
+
+rps_matches <- as.data.frame(do.call(rbind, replicate(N_games,simulate_rps(rps_thetas,N_opts),simplify = FALSE)))
+
+rps_matches <- rps_matches |> rename(player1="V1",
+                             player2="V2",
+                             hand1 = "V3",
+                             hand2 = "V4",
+                             result="V5")
+```
+
+```{r}
+starting_phi <- rep(0.25,N_opts-1)
+res <- estimate_nt_elo(N_ids, N_opts, rps_matches,starting_phi)
+sol <- res$sol
+starting_phi <- res$starting_phi
+
+
+```
+
+```{r}
+
+theta_rad <- sapply(rps_thetas, max)
+theta_rad_id <- sapply(rps_thetas, which.max)
+est_theta <- as.data.frame(list(est=sol$par[1:N_ids],
+                  true=theta_rad,
+                  true_hand_favored=theta_rad_id,
+                  id=c(1:N_ids)))
+est_phi <- as.data.frame(list(est=c(0,sol$par[(N_ids+1):length(sol$par)]),
+                r=rep(1,N_opts),
+                type=rep("est",N_opts),
+                id=c(1:N_opts))) |> 
+  mutate(phi = pi*(est%%2),
+         x = cos(phi),
+         y = sin(phi))
+
+```
+
+```{r}
+
+player_stats <- rbind(rps_matches |> select(player1,hand1) |> 
+                        rename_with(~ str_remove(., "\\d+$")),
+                      rps_matches |> select(player2,hand2) |> 
+                        rename_with(~ str_remove(., "\\d+$")))
+
+player_stats <- player_stats |> 
+  left_join(est_theta,
+            by=join_by(player==id)) |>
+  left_join(est_phi |> filter(type=="est") |> select(id,phi,x,y),
+            by=join_by(hand==id)) |>
+  rename(theta = est)
+
+
+player_pos <- player_stats |> 
+  group_by(player) |> 
+  summarise(across(c(x,y,true_hand_favored,true),mean)) |>
+  mutate(r=sqrt(x^2+y^2),
+         phi=atan2(y,x)) |>
+  rename(favored_hand=true_hand_favored)
+  
+
+
+p_phi_radial <- ggplot(player_pos) +
+  geom_point(aes(r, phi,color=factor(favored_hand))) +
+  coord_radial(theta="y",
+               start=pi/2,
+               direction=-1,
+               rlim=c(0,1),
+               thetalim = c(0,2*pi)) +
+  ggtitle("Player estimates") +
+  labs(color = "Favored Hand") +
+  scale_color_discrete(labels = c("Rock", "Paper", "Scissors"))
+
+r_value <- cor(player_pos$r,player_pos$true)
+p_phi_cart <- ggplot(player_pos) +
+  geom_point(aes(true, r)) + 
+  annotate("text", x = 0.9, y = 0, label = paste("r =", round(r_value,3))) +
+  ggtitle("Player ability/luck estimates")
+
+p_phi_cart | p_phi_radial
+```
