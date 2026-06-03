@@ -18,6 +18,7 @@ library(ggplot2)
 library(patchwork)
 library(latex2exp)
 library(see)
+options(warn = -1)
 ```
 
 ### Game simulation functions
@@ -32,7 +33,7 @@ simulate_elo_game <- function(thetas,N_opts=3){
   w <- rbinom(n=1,size=1,prob=p)
   ## Hand played is randomly chosen
   h <- sample(c(1:N_opts),2,replace=TRUE)
-  res <- c(t_ids[1],t_ids[2],h[1],h[2],w)
+  res <- c(t_ids[1],t_ids[2],h[1],h[2],w,p)
   return(res)
 }
 
@@ -68,7 +69,7 @@ simulate_rps <- function(thetas,N_opts,payoff=NULL,replace=FALSE){
   h <- sample(c(1:N_opts),2,replace=replace)
   w <- rbinom(1,1,p[h[1],h[2]])
   # w <- ifelse(prob>0,rbinom(1,1,prob),rbinom(1,1,1+prob))
-  res <- c(t_ids[1],t_ids[2],h[1],h[2],w)
+  res <- c(t_ids[1],t_ids[2],h[1],h[2],w,p[h[1],h[2]])
   return(res)
 }
 
@@ -90,7 +91,7 @@ simulate_rps_luck <- function(thetas,N_opts){
   if(w==0){
     h <- c(h[2],h[1])
   }
-  res <- c(t_ids[1],t_ids[2],h[1],h[2],w)
+  res <- c(t_ids[1],t_ids[2],h[1],h[2],w,w)
   return(res)
 }
 
@@ -101,8 +102,8 @@ simulate_NT_model <- function(thetas,phis,N_opts,replace=FALSE){
   
   d_theta <- thetas[t_ids[1]] - thetas[t_ids[2]]
   d_phi <- phis[h[1]] - phis[h[2]]
-  d_phi <- atan2(sin(d_phi),cos(d_phi))
-  g_d_phi <- sinpi(d_phi)
+  d_phi2 <- atan2(sinpi(d_phi),cospi(d_phi)) %% (2*pi)
+  g_d_phi <- 2*sin(d_phi2)
   # g_d_phi <- 2*atanh(sinpi(d_phi))
   
   logit <- d_theta + g_d_phi 
@@ -110,7 +111,24 @@ simulate_NT_model <- function(thetas,phis,N_opts,replace=FALSE){
   p <- plogis(logit)
   w <- rbinom(1,1,p)
   
-  res <- c(t_ids[1],t_ids[2],h[1],h[2],w)
+  res <- c(t_ids[1],t_ids[2],h[1],h[2],w,p)
+  return(res)
+}
+
+simulate_dice_rolls <- function(thetas,dice,replace=FALSE){
+  t_ids <- sample(c(1:length(thetas)),2,replace=FALSE)
+  N_opts <- length(dice)
+  
+  h <- sample(c(1:N_opts),2,replace=replace)
+  roll_1 <- sample(dice[[h[1]]],1)
+  roll_1_w_handicap <- roll_1 + thetas[t_ids[1]]
+  roll_2 <- sample(dice[[h[2]]],1)
+  roll_2_w_handicap <- roll_2 + thetas[t_ids[2]]
+  
+  p <- mean(outer(dice[[h[1]]]+ thetas[t_ids[1]],dice[[h[2]]]+ thetas[t_ids[2]],">="))
+  
+  w <- ifelse(roll_1_w_handicap >= roll_2_w_handicap,1,0)
+  res <- c(t_ids[1],t_ids[2],h[1],h[2],w,p)
   return(res)
 }
 
@@ -142,219 +160,216 @@ fit_elo_model <- function(N_players,matches){
   return(sol)
 }
 
-## Model with non-transitive effects (additive)
-LogLik_RPS <- function(params, data, N_ids) {
-  theta <- c(0,params[1:(N_ids-1)])
-  phi <- c(0,params[(N_ids):length(params)])
+
+LogLik_NT <- function(params, data, N_ids,
+                      theta_centering = TRUE,
+                      use_atanh = FALSE,
+                      scale_by_sd = FALSE,
+                      ridge_penalty = TRUE) {
+  
+  ## Mean centering or setting first theta to 0
+  if (theta_centering) {
+    theta <- params[1:N_ids]
+    theta <- theta - mean(theta)
+    phi <- c(0, params[(N_ids + 1):length(params)])
+  } else {
+    theta <- c(0, params[1:(N_ids - 1)])
+    phi <- c(0, params[N_ids:length(params)])
+  }
+
+  sigma_theta <- sd(theta)
   d_theta <- theta[data$player1] - theta[data$player2]
-  
+
   d_phi <- phi[data$hand1] - phi[data$hand2]
-  d_phi <- atan2(sin(d_phi),cos(d_phi))
-  ## Non-linear function of delta Phi -> g(delta_phi)
-  g_d_phi <- sinpi(d_phi)
-  
-  logit <- d_theta+g_d_phi
-  # logit <- d_theta+2*atanh(sinpi(d_phi))
-  
+  d_phi <- atan2(sinpi(d_phi), cospi(d_phi)) %% (2*pi)
+
+  if (use_atanh) {
+    g_d_phi <- 2 * atanh(sin(d_phi))
+  } else {
+    g_d_phi <- 2 * sin(d_phi)
+  }
+
+  if (scale_by_sd) {
+    g_d_phi <- g_d_phi * sigma_theta
+  }
+
+  logit <- d_theta + g_d_phi
   p <- plogis(logit)
   ll <- sum(data$result * log(p) + (1 - data$result) * log(1 - p))
-  
-  ## Ridge penalty
-  lambda <- 0.1
-  # penalty <- lambda*sum(abs(params)) ## Lasso
-  penalty <- lambda*sum(theta^2)
-  
+
+  penalty <- ifelse(ridge_penalty, 0.1 * sum(theta^2),0)
   neg_ll <- -ll + penalty
-  
-  ## 
-  if(is.finite(neg_ll)){
-    return(neg_ll)
-  }else{
-    return(1e10)
-  }
-  
+
+  if (is.finite(neg_ll)) neg_ll else 1e10
 }
 
-estimate_nt_elo <- function(N_ids,N_opts,matches,n_start=5){
-  
+estimate_nt_elo <- function(N_ids, N_opts, matches, n_start = 5,
+                            theta_centering = "mean",
+                            use_atanh = FALSE,
+                            scale_by_sd = FALSE,
+                            ridge_penalty = TRUE) {
+  n_theta <- ifelse(theta_centering,N_ids,N_ids-1)
+
   opt_sol <- NA
   opt_sol_val <- Inf
   opt_start <- NA
-  for (k in c(1:(n_start+2))){
-    # print(paste0("Starting conditions: ",k))
-    starting_theta <- rnorm(N_ids-1)
-    if (k == 1){
-      starting_phi <- rep(0.25,N_opts-1)
-    }else if (k == 2){
-      starting_phi <- c(1:(N_opts-1))*2/N_opts
-    }else {
-      starting_phi <- runif(N_opts-1,min=0,max=2)  
+
+  for (k in c(1:(n_start + 2))) {
+    starting_theta <- rnorm(n_theta)
+
+    if (k == 1) {
+      starting_phi <- rep(0.25, N_opts - 1)
+    } else if (k == 2) {
+      starting_phi <- c(1:(N_opts - 1)) * 2 / N_opts
+    } else {
+      starting_phi <- runif(N_opts - 1, min = 0, max = 2)
     }
-    
-    starting_params <- c(starting_theta,starting_phi)
+
+    starting_params <- c(starting_theta, starting_phi)
     sol <- optim(
       starting_params,
-      LogLik_RPS,
+      LogLik_NT,
       data = matches,
       N_ids = N_ids,
+      theta_centering = theta_centering,
+      use_atanh = use_atanh,
+      scale_by_sd = scale_by_sd,
+      ridge_penalty = ridge_penalty,
       method = 'L-BFGS-B',
       hessian = TRUE,
-      lower = c(rep(-Inf,(N_ids-1)),rep(0,(N_opts-1))),
-      upper = c(rep(Inf,(N_ids-1)),rep(2*pi,(N_opts-1))),
-      control = list(fnscale = 1,
-                     maxit = 1e6
-    ))
-    if(sol$value < opt_sol_val){
+      lower = c(rep(-Inf, n_theta), rep(0, N_opts - 1)),
+      upper = c(rep(Inf, n_theta), rep(2, N_opts - 1)),
+      control = list(fnscale = 1, maxit = 1e6)
+    )
+    if (sol$value < opt_sol_val) {
       opt_sol_val <- sol$value
       opt_sol <- sol
       opt_start <- starting_phi
     }
   }
-  
-  
-  return(list(sol=opt_sol,starting_phi=opt_start))
-}
 
-
-## Model with Beta factor and other experiments
-m_factor <- function(dt,dp){
-  return(sign(-sign(dt)*sign(dp) + (sign(dt)+sign(dp))))
-}
-
-LogLik_RPS_experiemnt <- function(params, data, N_ids, N_opts) {
-  theta <- c(0,params[1:(N_ids-1)])
-  phi <- c(0,params[(N_ids):(N_ids + N_opts - 2)])
-  beta <- tail(params,1)
-  d_theta <- theta[data$player1] - theta[data$player2]
-  
-  d_phi <- phi[data$hand1] - phi[data$hand2]
-  d_phi <- atan2(sin(d_phi),cos(d_phi))
-  
-  ## Non-linear function of delta Phi -> g(delta_phi)
-  # g_d_phi <- beta*sinpi(d_phi)
-  g_d_phi <- 2*atanh(sinpi(d_phi))
-  # g_d_phi <- sinpi(d_phi)
-  # g_d_phi <- 2*atanh(sinpi(d_phi))
-  
-  logit <- d_theta + g_d_phi + 0*sign(g_d_phi)*d_theta*g_d_phi
-  # logit <- (1+d_theta)*(1+g_d_phi)-1
-  # d_r <- r[data$hand2]/r[data$hand1]
-  
-  p <- plogis(logit)
-  ll <- sum(data$result * log(p) + (1 - data$result) * log(1 - p))
-  
-  ## Ridge penalty
-  lambda <- 0.1
-  # penalty <- lambda*sum(abs(params))
-  penalty <- lambda*sum(theta^2)
-  
-  neg_ll <- -ll + penalty
-  if(is.finite(neg_ll)){
-    return(neg_ll)
-  }else{
-    return(1e10)
-  }
-  # return(neg_ll)
-}
-
-estimate_nt_elo_experiement <- function(N_ids,N_opts,matches,n_start=5){
-  
-  # starting_phi <- rep(0.25,N_opts-1)
-  
-  # starting_phi <- c(1:(N_opts-1))*2/N_opts + rnorm((N_opts-1),0,0.1)
-  
-  # starting_phi <- (c(1:N_opts)-1)*2/N_opts
-  # starting_phi <- sample(starting_phi,N_opts,FALSE)
-  opt_sol <- NA
-  opt_sol_val <- Inf
-  opt_start <- NA
-  for (k in c(1:(n_start+2))){
-    starting_theta <- rnorm(N_ids-1)
-    starting_beta <- 1
-    if (k == 1){
-      starting_phi <- rep(0.25,N_opts-1)
-    }else if (k == 2){
-      starting_phi <- c(1:(N_opts-1))*2*pi/N_opts
-    }else {
-      starting_phi <- runif(N_opts-1,min=0,max=2)  
-    }
-    
-    starting_params <- c(starting_theta,starting_phi,starting_beta)
-    sol <- optim(
-      starting_params,
-      LogLik_RPS_experiemnt,
-      data = matches,
-      N_ids = N_ids,
-      N_opts = N_opts,
-      method = 'L-BFGS-B',
-      hessian = TRUE,
-      lower = c(rep(-Inf,(N_ids-1)),rep(0,(N_opts-1)),0),
-      upper = c(rep(Inf,(N_ids-1)),rep(2*pi,(N_opts-1)),1),
-      control = list(fnscale = 1,
-                     maxit = 1e6
-    ))
-    if(sol$value < opt_sol_val){
-      opt_sol_val <- sol$value
-      opt_sol <- sol
-      opt_start <- starting_phi
-    }
-  }
-  
-  
-  return(list(sol=opt_sol,starting_phi=opt_start))
+  return(list(sol = opt_sol, starting_phi = opt_start))
 }
 ```
 
 ### Plotting functions
 
 ```{r}
-plot_elo <- function(sol,thetas){
+plot_elo <- function(sol,thetas,p_true, p_pred,w){
   df <- data.frame(theta=thetas,theta_est=sol$par)
-  p <- ggplot(df,aes(x=theta,y=theta_est)) + 
+  p_elo <- ggplot(df,aes(x=theta,y=theta_est)) + 
     geom_point(color=okabeito_colors(3)) + 
     theme_bw() + 
     labs(x=TeX("$\\theta$"),y=TeX("$\\hat{\\theta}$")) + 
     annotate("text", x = 2, y = -3, 
              label = paste("r =", round(cor(df$theta,df$theta_est,method="spearman"),2)),
              size=4) + ggtitle("True vs. Estimated thetas (ELO Model)")
-  return(p)
+  
+  
+  if (!is.null(p_pred) && !is.null(p_true)) {
+    p_scatter <- ggplot(data.frame(p_pred=p_pred, p_true=p_true),
+                        aes(x=p_pred, y=p_true,color=as.factor(w))) +
+      geom_point(size=1, alpha=0.5) +
+      theme_bw() +
+      labs(x="Predicted Prob", y="True p / Result", title="Predicted vs True",colour="Result")
+    return(p_elo | p_scatter)
+  }
+  return(p_elo)
 }
 
-plot_nt_elo <- function(sol,thetas,N_ids,N_opts,labels=c("Rock", "Paper", "Scissors")){
+plot_nt_elo <- function(sol, thetas, N_ids, N_opts, theta_centering=TRUE,
+                        labels=c("Rock", "Paper", "Scissors"),
+                        p_pred=NULL, p_true=NULL,w=NULL){
   
-  est_theta <- as.data.frame(list(est=c(0,sol$par[1:(N_ids-1)]),
-                  true=thetas))
-  est_phi <- as.data.frame(list(est=c(0,sol$par[(N_ids):(N_ids+N_opts-2)]),
-                  r=rep(1,N_opts),
-                  type=rep("est",N_opts),
-                  id=c(1:N_opts)))
   
-  est_phi <- est_phi |> mutate(phi=pi*(est%%2))
-  # est_phi <- est_phi |> mutate(phi=(est%%2))
-  
-  est_theta_mu <- round(mean(est_theta$est),2)
-  est_theta_var <- round(sd(est_theta$est)^2,3)
-  
+  if (theta_centering){
+    est_th <- sol$par[1:N_ids]
+    est_th <- est_th - mean(est_th)
+    theta_offset <- 0
+  } else {
+    est_th <- c(0, sol$par[1:(N_ids - 1)])
+    theta_offset <- 1
+  }
+
+  est_theta <- as.data.frame(list(est=est_th, true=thetas))
+
+  est_phi <- as.data.frame(list(
+    est = c(0, sol$par[(N_ids + 1 - theta_offset):length(sol$par)]),
+    r   = rep(1, N_opts),
+    id  = c(1:N_opts)
+  ))
+  est_phi <- est_phi |> mutate(phi = pi * (est %% 2))
+
+  est_theta_mu  <- round(mean(est_theta$est), 2)
+  est_theta_var <- round(sd(est_theta$est)^2, 2)
+
   p_phi <- ggplot(est_phi) +
-    geom_point(aes(r, phi,color=factor(id)),size=2) + 
+    geom_point(aes(r, phi, color=factor(id)), size=2) +
     coord_radial(theta="y",
                  start=pi/2,
-                 direction=-1,
                  rlim=c(0,1),
-                 thetalim = c(0,2*pi)) +
-    ggtitle("Phi estimates") +
-    labs(color = "Hand",shape="") +
-    scale_color_discrete(labels = labels)
+                 thetalim=c(0, 2*pi),
+                 reverse = "theta",
+                 expand=FALSE) +
+    scale_y_continuous(breaks=c(0,pi/2,pi,3*pi/2,2*pi),
+                       labels = c("0", "π/2", "π", "3π/2", "2π")) +
+    ggtitle("Phi") +
+    labs(color="Hand",x="",y="") +
+    scale_color_discrete(labels=labels)
+
+  scatter_title <- paste0("Theta~N(", est_theta_mu, ",", est_theta_var, "), r=",
+         round(cor(est_theta$est, est_theta$true, method="spearman"), 2))
   
-  
-  p_theta <- ggplot(est_theta,aes(x=true,y=est)) + 
-    geom_point() + 
+  p_theta <- ggplot(est_theta, aes(x=true, y=est)) +
+    geom_point() +
     theme_bw() +
-    ggtitle(paste0("Theta ~ N(",est_theta_mu,",",est_theta_var,"), r=",
-                   round(cor(est_theta$est,est_theta$true,method="spearman"),2)))
-  
+    ggtitle(str_wrap(scatter_title,20))
+
+  if (!is.null(p_pred) && !is.null(p_true)) {
+    p_scatter <- ggplot(data.frame(p_pred=p_pred, p_true=p_true),
+                        aes(x=p_pred, y=p_true,color=as.factor(w))) +
+      geom_point(size=1, alpha=0.5) +
+      theme_bw() +
+      labs(x="Predicted prob", y="True prob", title="Predicted vs True",colour="Result")
+    return(p_theta | p_phi | p_scatter)
+  }
+
   return(p_theta | p_phi)
 }
+
+get_predicted_prob <- function(matches,theta,phi=NULL,use_atanh=FALSE,scale_by_sd=FALSE,use_theta=TRUE){
+  if(is.null(phi)){
+    phi <- rep(0,max(c(matches$hand1,matches$hand2)))
+  }
+  
+  d_theta <- theta[matches$player1] - theta[matches$player2]
+  d_phi <- phi[matches$hand1] - phi[matches$hand2]
+  
+  d_phi2 <- atan2(sinpi(d_phi),cospi(d_phi)) %% (2*pi)
+  
+  if(use_atanh){
+    g_d_phi <- 2*atanh(sin(d_phi2))
+  }else{
+    g_d_phi <- 2*sin(d_phi2)
+  }
+  
+  logit <- use_theta*d_theta + g_d_phi 
+  pred_p <- plogis(logit)
+  return(pred_p)
+}
+
+get_res_estimates <- function(res,N_ids,theta_centering){
+  if(theta_centering){
+    res_theta <- res$sol$par[1:N_ids]
+    res_theta <- res_theta - mean(res_theta)
+    res_phi <- c(0,res$sol$par[(N_ids+1):length(res$sol$par)])
+  }else{
+    res_theta <- c(0,res$sol$par[1:(N_ids-1)])
+    res_phi <- c(0,res$sol$par[N_ids:length(res$sol$par)])
+  }
+  return(list(theta=res_theta,phi=res_phi))
+}
+
 ```
 
 # Simulating Games and Testing model fits
@@ -373,18 +388,37 @@ elo_matches <- elo_matches |> rename(player1="V1",
                              player2="V2",
                              hand1 = "V3",
                              hand2 = "V4",
-                             result="V5")
+                             result="V5",
+                             true_p="V6")
 ```
 
 ```{r}
 elo_sol <- fit_elo_model(N_ids,elo_matches)
-plot_elo(elo_sol,elo_thetas)
+elo_pred <- get_predicted_prob(elo_matches,theta=elo_sol$par)
+plot_elo(elo_sol,elo_thetas,p_true=elo_matches$true_p,p_pred=elo_pred,w=elo_matches$result)
 
-res_nt <- estimate_nt_elo(N_ids,N_opts=3,elo_matches)
-plot_nt_elo(res_nt$sol,elo_thetas,N_ids,N_opts=3)
+res_nt <- estimate_nt_elo(N_ids,N_opts=3,elo_matches,n_start = 10,
+                          theta_centering = TRUE,
+                          use_atanh = FALSE,
+                          scale_by_sd = FALSE,
+                          ridge_penalty = TRUE)
 
-res_nt <- estimate_nt_elo_experiement(N_ids,N_opts=3,elo_matches)
-plot_nt_elo(res_nt$sol,elo_thetas,N_ids,N_opts=3)
+estimates <- get_res_estimates(res_nt,N_ids,theta_centering=TRUE)
+pred_p <- get_predicted_prob(elo_matches,theta=estimates$theta,phi=estimates$phi)
+
+plot_nt_elo(res_nt$sol,elo_thetas,N_ids,N_opts=3,theta_centering = TRUE,
+            p_true=elo_matches$true_p,p_pred=pred_p,w=elo_matches$result)
+
+res_nt <- estimate_nt_elo(N_ids,N_opts=3,elo_matches,n_start = 10,
+                          theta_centering=FALSE,use_atanh=TRUE)
+
+estimates <- get_res_estimates(res_nt,N_ids,theta_centering=FALSE)
+pred_p <- get_predicted_prob(elo_matches,
+                             theta=estimates$theta,phi=estimates$phi,
+                             use_atanh = TRUE)
+
+plot_nt_elo(res_nt$sol,elo_thetas,N_ids,N_opts=3,theta_centering = FALSE,
+            p_true=elo_matches$true_p,p_pred=pred_p,w=elo_matches$result)
 
 
 ```
@@ -407,19 +441,53 @@ rps_matches <- rps_matches |> rename(player1="V1",
                              player2="V2",
                              hand1 = "V3",
                              hand2 = "V4",
-                             result="V5")
+                             result="V5",
+                             true_p="V6")
 ```
 
 ```{r}
-## Fitting ELO model to RPS Data
-rps_elo_sol <- fit_elo_model(N_ids,rps_matches)
-plot_elo(rps_elo_sol,rps_thetas)
-## Fitting simple non-transitive model
-res_nt <- estimate_nt_elo(N_ids, N_opts, rps_matches)
-plot_nt_elo(res_nt$sol,rps_thetas,N_ids,N_opts,labels=c("Rock", "Paper", "Scissors","Spock","Lizard"))
-## Fitting experiemental non-transitive model
-res_nt <- estimate_nt_elo_experiement(N_ids, N_opts, rps_matches)
-plot_nt_elo(res_nt$sol,rps_thetas,N_ids,N_opts,labels=c("Rock", "Paper", "Scissors","Spock","Lizard"))
+
+elo_sol <- fit_elo_model(N_ids,rps_matches)
+elo_pred <- get_predicted_prob(rps_matches,theta=elo_sol$par)
+plot_elo(elo_sol,rps_thetas,p_true=rps_matches$true_p,p_pred=elo_pred,w=rps_matches$result)
+
+res_nt <- estimate_nt_elo(N_ids,N_opts,rps_matches,n_start = 10,
+                          theta_centering = TRUE,
+                          use_atanh = FALSE,
+                          scale_by_sd = FALSE,
+                          ridge_penalty = TRUE)
+
+estimates <- get_res_estimates(res_nt,N_ids,theta_centering=TRUE)
+pred_p <- get_predicted_prob(rps_matches,theta=estimates$theta,phi=estimates$phi)
+
+
+plot_nt_elo(res_nt$sol,rps_thetas,N_ids,N_opts,theta_centering = TRUE,
+            p_true=rps_matches$true_p,p_pred=pred_p,w=rps_matches$result,
+            labels=c("Rock", "Paper", "Scissors","Spock","Lizard"))
+
+res_nt <- estimate_nt_elo(N_ids,N_opts,rps_matches,n_start = 10,
+                          theta_centering=FALSE,use_atanh=TRUE)
+
+
+estimates <- get_res_estimates(res_nt,N_ids,theta_centering=FALSE)
+pred_p <- get_predicted_prob(rps_matches,
+                             theta=estimates$theta,phi=estimates$phi,
+                             use_atanh = TRUE)
+
+plot_nt_elo(res_nt$sol,rps_thetas,N_ids,N_opts,theta_centering = FALSE,
+            p_true=rps_matches$true_p,p_pred=pred_p,w=rps_matches$result,
+            labels=c("Rock", "Paper", "Scissors","Spock","Lizard"))
+
+
+# ## Fitting ELO model to RPS Data
+# rps_elo_sol <- fit_elo_model(N_ids,rps_matches)
+# plot_elo(rps_elo_sol,rps_thetas)
+# ## Fitting simple non-transitive model
+# res_nt <- estimate_nt_elo(N_ids, N_opts, rps_matches)
+# plot_nt_elo(res_nt$sol,rps_thetas,N_ids,N_opts,labels=c("Rock", "Paper", "Scissors","Spock","Lizard"))
+# ## Fitting experiemental non-transitive model
+# res_nt <- estimate_nt_elo(N_ids, N_opts, rps_matches,theta_centering="fixed",use_atanh=TRUE)
+# plot_nt_elo(res_nt$sol,rps_thetas,N_ids,N_opts,theta_offset=1,labels=c("Rock", "Paper", "Scissors","Spock","Lizard"))
 
 ```
 
@@ -437,19 +505,49 @@ rps_matches <- rps_matches |> rename(player1="V1",
                              player2="V2",
                              hand1 = "V3",
                              hand2 = "V4",
-                             result="V5")
+                             result="V5",
+                             true_p="V6")
 ```
 
 ```{r}
-## Fitting ELO model to RPS Data
-rps_elo_sol <- fit_elo_model(N_ids,rps_matches)
-plot_elo(rps_elo_sol,rps_thetas)
-## Fitting simple non-transitive model
-res_nt <- estimate_nt_elo(N_ids, N_opts, rps_matches)
-plot_nt_elo(res_nt$sol,rps_thetas,N_ids,N_opts,labels=c("Rock", "Paper", "Scissors","Spock","Lizard"))
-## Fitting experiemental non-transitive model
-res_nt <- estimate_nt_elo_experiement(N_ids, N_opts, rps_matches)
-plot_nt_elo(res_nt$sol,rps_thetas,N_ids,N_opts,labels=c("Rock", "Paper", "Scissors","Spock","Lizard"))
+elo_sol <- fit_elo_model(N_ids,rps_matches)
+elo_pred <- get_predicted_prob(rps_matches,theta=elo_sol$par)
+plot_elo(elo_sol,rps_thetas,p_true=rps_matches$true_p,p_pred=elo_pred,w=rps_matches$result)
+
+res_nt <- estimate_nt_elo(N_ids,N_opts,rps_matches,n_start = 10,
+                          theta_centering = TRUE,
+                          use_atanh = FALSE,
+                          scale_by_sd = FALSE,
+                          ridge_penalty = TRUE)
+
+estimates <- get_res_estimates(res_nt,N_ids,theta_centering=TRUE)
+pred_p <- get_predicted_prob(rps_matches,theta=estimates$theta,phi=estimates$phi)
+
+plot_nt_elo(res_nt$sol,rps_thetas,N_ids,N_opts,theta_centering = TRUE,
+            p_true=rps_matches$true_p,p_pred=pred_p,w=rps_matches$result,
+            labels=c("Rock", "Paper", "Scissors","Spock","Lizard"))
+
+res_nt <- estimate_nt_elo(N_ids,N_opts,rps_matches,n_start = 10,
+                          theta_centering=FALSE,use_atanh=TRUE)
+
+estimates <- get_res_estimates(res_nt,N_ids,theta_centering=FALSE)
+pred_p <- get_predicted_prob(rps_matches,
+                             theta=estimates$theta,phi=estimates$phi,
+                             use_atanh = TRUE)
+
+plot_nt_elo(res_nt$sol,rps_thetas,N_ids,N_opts,theta_centering = FALSE,
+            p_true=rps_matches$true_p,p_pred=pred_p,w=rps_matches$result,
+            labels=c("Rock", "Paper", "Scissors","Spock","Lizard"))
+
+# ## Fitting ELO model to RPS Data
+# rps_elo_sol <- fit_elo_model(N_ids,rps_matches)
+# plot_elo(rps_elo_sol,rps_thetas)
+# ## Fitting simple non-transitive model
+# res_nt <- estimate_nt_elo(N_ids, N_opts, rps_matches)
+# plot_nt_elo(res_nt$sol,rps_thetas,N_ids,N_opts,labels=c("Rock", "Paper", "Scissors","Spock","Lizard"))
+# ## Fitting experiemental non-transitive model
+# res_nt <- estimate_nt_elo(N_ids, N_opts, rps_matches,theta_centering="fixed",use_atanh=TRUE)
+# plot_nt_elo(res_nt$sol,rps_thetas,N_ids,N_opts,theta_offset=1,labels=c("Rock", "Paper", "Scissors","Spock","Lizard"))
 ```
 
 ### RPS with "luck"
@@ -465,19 +563,77 @@ rps_luck_matches <- rps_luck_matches |> rename(player1="V1",
                              player2="V2",
                              hand1 = "V3",
                              hand2 = "V4",
-                             result="V5")
+                             result="V5",
+                             true_p="V6")
 ```
 
 ```{r}
-## Fitting an ELO Model to luck data
-res_elo_rps_luck <- fit_elo_model(N_ids,rps_luck_matches)
-plot_elo(res_elo_rps_luck,rps_luck_thetas)
+elo_sol <- fit_elo_model(N_ids,rps_luck_matches)
+elo_pred <- get_predicted_prob(rps_luck_matches,theta=elo_sol$par)
+plot_elo(elo_sol,rps_luck_thetas,p_true=rps_luck_matches$true_p,p_pred=elo_pred,w=rps_luck_matches$result)
 
-res_rps_luck <- estimate_nt_elo(N_ids, N_opts, rps_luck_matches,10)
-plot_nt_elo(res_rps_luck$sol,rps_luck_thetas,N_ids,N_opts,labels=c("Rock", "Paper", "Scissors","Spock","Lizard"))
+res_nt <- estimate_nt_elo(N_ids,N_opts,rps_luck_matches,n_start = 10,
+                          theta_centering = TRUE,
+                          use_atanh = FALSE,
+                          scale_by_sd = FALSE,
+                          ridge_penalty = TRUE)
 
-res_rps_luck_exp <- estimate_nt_elo_experiement(N_ids, N_opts, rps_luck_matches,10)
-plot_nt_elo(res_rps_luck_exp$sol,rps_luck_thetas,N_ids,N_opts,labels=c("Rock", "Paper", "Scissors","Spock","Lizard"))
+estimates <- get_res_estimates(res_nt,N_ids,theta_centering=TRUE)
+pred_p <- get_predicted_prob(rps_luck_matches,theta=estimates$theta,phi=estimates$phi)
+
+plot_nt_elo(res_nt$sol,rps_luck_thetas,N_ids,N_opts,theta_centering = TRUE,
+            p_true=rps_luck_matches$true_p,p_pred=pred_p,w=rps_luck_matches$result,
+            labels=c("Rock", "Paper", "Scissors","Spock","Lizard"))
+
+res_nt <- estimate_nt_elo(N_ids,N_opts,rps_luck_matches,n_start = 10,
+                          theta_centering=FALSE,use_atanh=TRUE)
+
+estimates <- get_res_estimates(res_nt,N_ids,theta_centering=FALSE)
+pred_p <- get_predicted_prob(rps_luck_matches,
+                             theta=estimates$theta,phi=estimates$phi,
+                             use_atanh = TRUE)
+
+plot_nt_elo(res_nt$sol,rps_luck_thetas,N_ids,N_opts,theta_centering = FALSE,
+            p_true=rps_luck_matches$true_p,p_pred=pred_p,w=rps_luck_matches$result,
+            labels=c("Rock", "Paper", "Scissors","Spock","Lizard"))
+
+# res_elo_rps_luck <- fit_elo_model(N_ids,rps_luck_matches)
+# res_rps_luck     <- estimate_nt_elo(N_ids, N_opts, rps_luck_matches, 10)
+# res_rps_luck_exp <- estimate_nt_elo(N_ids, N_opts, rps_luck_matches, 10, theta_centering="fixed", use_atanh=TRUE)
+# 
+# est_thetas <- as_tibble(res_elo_rps_luck$par) |> rename(elo_theta='value') |> mutate(id=row_number())
+# est_thetas$rps_theta     <- res_rps_luck$sol$par[1:N_ids]
+# est_thetas$rps_exp_theta <- c(0, res_rps_luck_exp$sol$par[1:(N_ids-1)])
+# 
+# est_phis <- as_tibble(c(1:N_opts)) |> rename(hand='value')
+# est_phis$rps_phi     <- c(0, res_rps_luck$sol$par[(N_ids+1):(N_ids+N_opts-1)])
+# est_phis$rps_exp_phi <- c(0, res_rps_luck_exp$sol$par[N_ids:(N_ids+N_opts-2)])
+# 
+# rps_luck_matches_predict <- rps_luck_matches |>
+#   left_join(est_thetas, by=join_by(player1==id)) |>
+#   left_join(est_thetas, by=join_by(player2==id)) |>
+#   left_join(est_phis,   by=join_by(hand1==hand)) |>
+#   left_join(est_phis,   by=join_by(hand2==hand)) |>
+#   mutate(elo_d_theta     = elo_theta.x - elo_theta.y,
+#          rps_d_theta     = rps_theta.x - rps_theta.y,
+#          rps_exp_d_theta = rps_exp_theta.x - rps_exp_theta.y,
+#          rps_d_phi       = rps_phi.x - rps_phi.y,
+#          rps_exp_d_phi   = rps_exp_phi.x - rps_exp_phi.y,
+#          rps_g_d_phi     = 2*sin(atan2(sinpi(rps_d_phi), cospi(rps_d_phi))),
+#          rps_exp_g_d_phi = 2*atanh(sin(atan2(sinpi(rps_exp_d_phi), cospi(rps_exp_d_phi)))),
+#          p_elo     = plogis(elo_d_theta),
+#          p_rps     = plogis(rps_d_theta + rps_g_d_phi),
+#          p_rps_exp = plogis(rps_exp_d_theta + rps_exp_g_d_phi))
+# 
+# plot_elo(res_elo_rps_luck, rps_luck_thetas)
+# plot_nt_elo(res_rps_luck$sol, rps_luck_thetas, N_ids, N_opts,
+#             labels=c("Rock","Paper","Scissors","Spock","Lizard"),
+#             p_pred=rps_luck_matches_predict$p_rps,
+#             p_true=rps_luck_matches_predict$result)
+# plot_nt_elo(res_rps_luck_exp$sol, rps_luck_thetas, N_ids, N_opts, theta_offset=1,
+#             labels=c("Rock","Paper","Scissors","Spock","Lizard"),
+#             p_pred=rps_luck_matches_predict$p_rps_exp,
+#             p_true=rps_luck_matches_predict$result)
 ```
 
 ## Non-Transitive Dice game
@@ -527,46 +683,108 @@ grime_dice_matches <- grime_dice_matches |> rename(player1="V1",
                              player2="V2",
                              hand1 = "V3",
                              hand2 = "V4",
-                             result="V5")
+                             result="V5",
+                             true_p="V6")
 ```
 
 ```{r}
+
+
+elo_sol <- fit_elo_model(N_ids,grime_dice_matches)
+elo_pred <- get_predicted_prob(grime_dice_matches,theta=elo_sol$par)
+plot_elo(elo_sol,thetas,p_true=grime_dice_matches$true_p,p_pred=elo_pred,w=grime_dice_matches$result)
+
+res_nt <- estimate_nt_elo(N_ids,N_opts,grime_dice_matches,n_start = 10,
+                          theta_centering = TRUE,
+                          use_atanh = FALSE,
+                          scale_by_sd = FALSE,
+                          ridge_penalty = TRUE)
+
+estimates <- get_res_estimates(res_nt,N_ids,theta_centering=TRUE)
+pred_p <- get_predicted_prob(grime_dice_matches,theta=estimates$theta,phi=estimates$phi)
+
+plot_nt_elo(res_nt$sol,thetas,N_ids,N_opts,theta_centering = TRUE,
+            p_true=grime_dice_matches$true_p,p_pred=pred_p,w=grime_dice_matches$result,
+            labels=c("Red", "Blue", "Olive", "Yellow", "Magenta"))
+
+est_thetas <- estimates$theta
+est_phis <- estimates$phi
+post_estimation <- grime_dice_matches |>
+  mutate(d_theta = est_thetas[player1]-est_thetas[player2],
+         d_phi = est_phis[hand1]-est_phis[hand2],
+         d_phi2 = atan2(sinpi(d_phi), cospi(d_phi)) %% (2*pi),
+         exponent = -(2*sin(d_phi2)),
+         prob = 1/(1+exp(exponent))) |>
+  group_by(hand1,hand2) |>
+  summarise(expected_payoff=mean(prob),.groups = "drop_last")
+
 payoff_mat
-
-res <- estimate_nt_elo(N_ids,N_opts,grime_dice_matches,n_start=10)
-plot_nt_elo(res$sol,thetas,N_ids,N_opts,labels=c("Red", "Blue", "Olive", "Yellow", "Magenta"))
-
-est_thetas <- c(0,res$sol$par[1:(N_ids-1)])
-est_phis <- c(0,tail(res$sol$par,N_opts-1))
-post_estimation <- grime_dice_matches |> 
-  mutate(d_theta = est_thetas[player1]-est_thetas[player2],
-         d_phi = est_phis[hand1]-est_phis[hand2],
-         d_phi2 = atan2(sin(d_phi),cos(d_phi)),
-         exponent = -(d_theta+sinpi(d_phi2)),
-         prob = 1/(1+exp(exponent))) |>
-  group_by(hand1,hand2) |>
-  summarise(expected_payoff=mean(prob),.groups = "drop_last")
-
 est_payoff_mat <- xtabs(expected_payoff ~ hand1 + hand2, data=post_estimation)
 est_payoff_mat
 
 
-res <- estimate_nt_elo_experiement(N_ids,N_opts,grime_dice_matches,n_start=10)
-plot_nt_elo(res$sol,thetas,N_ids,N_opts,labels=c("Red", "Blue", "Olive", "Yellow", "Magenta"))
+res_nt <- estimate_nt_elo(N_ids,N_opts,grime_dice_matches,n_start = 10,
+                          theta_centering=FALSE,use_atanh=TRUE)
 
-est_thetas <- c(0,res$sol$par[1:(N_ids-1)])
-est_phis <- c(0,tail(res$sol$par,N_opts-1))
-post_estimation <- grime_dice_matches |> 
+estimates <- get_res_estimates(res_nt,N_ids,theta_centering=FALSE)
+pred_p <- get_predicted_prob(grime_dice_matches,
+                             theta=estimates$theta,phi=estimates$phi,
+                             use_atanh = TRUE)
+
+plot_nt_elo(res_nt$sol,thetas,N_ids,N_opts,theta_centering = FALSE,
+            p_true=grime_dice_matches$true_p,p_pred=pred_p,w=grime_dice_matches$result,
+            labels=c("Red", "Blue", "Olive", "Yellow", "Magenta"))
+
+est_thetas <- estimates$theta
+est_phis <- estimates$phi
+post_estimation <- grime_dice_matches |>
   mutate(d_theta = est_thetas[player1]-est_thetas[player2],
          d_phi = est_phis[hand1]-est_phis[hand2],
-         d_phi2 = atan2(sin(d_phi),cos(d_phi)),
-         exponent = -(d_theta+2*atanh(sinpi(d_phi2))),
+         d_phi2 = atan2(sinpi(d_phi), cospi(d_phi)) %% (2*pi),
+         exponent = -(2*atanh(sin(d_phi2))),
          prob = 1/(1+exp(exponent))) |>
   group_by(hand1,hand2) |>
   summarise(expected_payoff=mean(prob),.groups = "drop_last")
 
+payoff_mat
 est_payoff_mat <- xtabs(expected_payoff ~ hand1 + hand2, data=post_estimation)
 est_payoff_mat
+
+# res <- estimate_nt_elo(N_ids,N_opts,grime_dice_matches,n_start=10)
+# plot_nt_elo(res$sol,thetas,N_ids,N_opts,labels=c("Red", "Blue", "Olive", "Yellow", "Magenta"))
+# 
+# est_thetas <- c(0,res$sol$par[1:(N_ids-1)])
+# est_phis <- c(0,tail(res$sol$par,N_opts-1))
+# post_estimation <- grime_dice_matches |> 
+#   mutate(d_theta = est_thetas[player1]-est_thetas[player2],
+#          d_phi = est_phis[hand1]-est_phis[hand2],
+#          d_phi2 = atan2(sin(d_phi),cos(d_phi)),
+#          exponent = -(2*sinpi(d_phi2)),
+#          prob = 1/(1+exp(exponent))) |>
+#   group_by(hand1,hand2) |>
+#   summarise(expected_payoff=mean(prob),.groups = "drop_last")
+# 
+# payoff_mat
+# est_payoff_mat <- xtabs(expected_payoff ~ hand1 + hand2, data=post_estimation)
+# est_payoff_mat
+
+
+# res <- estimate_nt_elo(N_ids,N_opts,grime_dice_matches,n_start=10,theta_centering="fixed",use_atanh=TRUE)
+# plot_nt_elo(res$sol,thetas,N_ids,N_opts,labels=c("Red", "Blue", "Olive", "Yellow", "Magenta"))
+# 
+# est_thetas <- c(0,res$sol$par[1:(N_ids-1)])
+# est_phis <- c(0,tail(res$sol$par,N_opts-1))
+# post_estimation <- grime_dice_matches |> 
+#   mutate(d_theta = est_thetas[player1]-est_thetas[player2],
+#          d_phi = est_phis[hand1]-est_phis[hand2],
+#          d_phi2 = atan2(sin(d_phi),cos(d_phi)),
+#          exponent = -(d_theta+2*atanh(sinpi(d_phi2))),
+#          prob = 1/(1+exp(exponent))) |>
+#   group_by(hand1,hand2) |>
+#   summarise(expected_payoff=mean(prob),.groups = "drop_last")
+# 
+# est_payoff_mat <- xtabs(expected_payoff ~ hand1 + hand2, data=post_estimation)
+# est_payoff_mat
 ```
 
 ### 4-dice
@@ -588,46 +806,71 @@ grime_dice_matches <- grime_dice_matches |> rename(player1="V1",
                              player2="V2",
                              hand1 = "V3",
                              hand2 = "V4",
-                             result="V5")
+                             result="V5",
+                             true_p="V6")
 ```
 
 ```{r}
+elo_sol <- fit_elo_model(N_ids,grime_dice_matches)
+elo_pred <- get_predicted_prob(grime_dice_matches,theta=elo_sol$par)
+plot_elo(elo_sol,thetas,p_true=grime_dice_matches$true_p,p_pred=elo_pred,w=grime_dice_matches$result)
+
+res_nt <- estimate_nt_elo(N_ids,N_opts,grime_dice_matches,n_start = 10,
+                          theta_centering = TRUE,
+                          use_atanh = FALSE,
+                          scale_by_sd = FALSE,
+                          ridge_penalty = TRUE)
+
+estimates <- get_res_estimates(res_nt,N_ids,theta_centering=TRUE)
+pred_p <- get_predicted_prob(grime_dice_matches,theta=estimates$theta,phi=estimates$phi)
+
+plot_nt_elo(res_nt$sol,thetas,N_ids,N_opts,theta_centering = TRUE,
+            p_true=grime_dice_matches$true_p,p_pred=pred_p,w=grime_dice_matches$result,
+            labels=c("Red", "Blue", "Olive", "Yellow", "Magenta"))
+
+est_thetas <- estimates$theta
+est_phis <- estimates$phi
+post_estimation <- grime_dice_matches |>
+  mutate(d_theta = est_thetas[player1]-est_thetas[player2],
+         d_phi = est_phis[hand1]-est_phis[hand2],
+         d_phi2 = atan2(sinpi(d_phi), cospi(d_phi)) %% (2*pi),
+         exponent = -(2*sin(d_phi2)),
+         prob = 1/(1+exp(exponent))) |>
+  group_by(hand1,hand2) |>
+  summarise(expected_payoff=mean(prob),.groups = "drop_last")
+
 payoff_mat
-
-res <- estimate_nt_elo(N_ids,N_opts,grime_dice_matches,n_start=10)
-plot_nt_elo(res$sol,thetas,N_ids,N_opts,labels=c("Red", "Blue", "Olive", "Yellow", "Magenta"))
-
-est_thetas <- c(0,res$sol$par[1:(N_ids-1)])
-est_phis <- c(0,tail(res$sol$par,N_opts-1))
-post_estimation <- grime_dice_matches |> 
-  mutate(d_theta = est_thetas[player1]-est_thetas[player2],
-         d_phi = est_phis[hand1]-est_phis[hand2],
-         d_phi2 = atan2(sin(d_phi),cos(d_phi)),
-         exponent = -(d_theta+sinpi(d_phi2)),
-         prob = 1/(1+exp(exponent))) |>
-  group_by(hand1,hand2) |>
-  summarise(expected_payoff=mean(prob),.groups = "drop_last")
-
 est_payoff_mat <- xtabs(expected_payoff ~ hand1 + hand2, data=post_estimation)
 est_payoff_mat
 
 
-res <- estimate_nt_elo_experiement(N_ids,N_opts,grime_dice_matches,n_start=10)
-plot_nt_elo(res$sol,thetas,N_ids,N_opts,labels=c("Red", "Blue", "Olive", "Yellow", "Magenta"))
+res_nt <- estimate_nt_elo(N_ids,N_opts,grime_dice_matches,n_start = 10,
+                          theta_centering=FALSE,use_atanh=TRUE)
 
-est_thetas <- c(0,res$sol$par[1:(N_ids-1)])
-est_phis <- c(0,tail(res$sol$par,N_opts-1))
-post_estimation <- grime_dice_matches |> 
+estimates <- get_res_estimates(res_nt,N_ids,theta_centering=FALSE)
+pred_p <- get_predicted_prob(grime_dice_matches,
+                             theta=estimates$theta,phi=estimates$phi,
+                             use_atanh = TRUE)
+
+plot_nt_elo(res_nt$sol,thetas,N_ids,N_opts,theta_centering = FALSE,
+            p_true=grime_dice_matches$true_p,p_pred=pred_p,w=grime_dice_matches$result,
+            labels=c("Red", "Blue", "Olive", "Yellow", "Magenta"))
+
+est_thetas <- estimates$theta
+est_phis <- estimates$phi
+post_estimation <- grime_dice_matches |>
   mutate(d_theta = est_thetas[player1]-est_thetas[player2],
          d_phi = est_phis[hand1]-est_phis[hand2],
-         d_phi2 = atan2(sin(d_phi),cos(d_phi)),
-         exponent = -(d_theta+2*atanh(sinpi(d_phi2))),
+         d_phi2 = atan2(sinpi(d_phi), cospi(d_phi)) %% (2*pi),
+         exponent = -(2*atanh(sin(d_phi2))),
          prob = 1/(1+exp(exponent))) |>
   group_by(hand1,hand2) |>
   summarise(expected_payoff=mean(prob),.groups = "drop_last")
 
+payoff_mat
 est_payoff_mat <- xtabs(expected_payoff ~ hand1 + hand2, data=post_estimation)
 est_payoff_mat
+
 ```
 
 ### 5-dice
@@ -649,46 +892,71 @@ grime_dice_matches <- grime_dice_matches |> rename(player1="V1",
                              player2="V2",
                              hand1 = "V3",
                              hand2 = "V4",
-                             result="V5")
+                             result="V5",
+                             true_p="V6")
 ```
 
 ```{r}
+elo_sol <- fit_elo_model(N_ids,grime_dice_matches)
+elo_pred <- get_predicted_prob(grime_dice_matches,theta=elo_sol$par)
+plot_elo(elo_sol,thetas,p_true=grime_dice_matches$true_p,p_pred=elo_pred,w=grime_dice_matches$result)
+
+res_nt <- estimate_nt_elo(N_ids,N_opts,grime_dice_matches,n_start = 10,
+                          theta_centering = TRUE,
+                          use_atanh = FALSE,
+                          scale_by_sd = FALSE,
+                          ridge_penalty = TRUE)
+
+estimates <- get_res_estimates(res_nt,N_ids,theta_centering=TRUE)
+pred_p <- get_predicted_prob(grime_dice_matches,theta=estimates$theta,phi=estimates$phi)
+
+plot_nt_elo(res_nt$sol,thetas,N_ids,N_opts,theta_centering = TRUE,
+            p_true=grime_dice_matches$true_p,p_pred=pred_p,w=grime_dice_matches$result,
+            labels=c("Red", "Blue", "Olive", "Yellow", "Magenta"))
+
+est_thetas <- estimates$theta
+est_phis <- estimates$phi
+post_estimation <- grime_dice_matches |>
+  mutate(d_theta = est_thetas[player1]-est_thetas[player2],
+         d_phi = est_phis[hand1]-est_phis[hand2],
+         d_phi2 = atan2(sinpi(d_phi), cospi(d_phi)) %% (2*pi),
+         exponent = -(2*sin(d_phi2)),
+         prob = 1/(1+exp(exponent))) |>
+  group_by(hand1,hand2) |>
+  summarise(expected_payoff=mean(prob),.groups = "drop_last")
+
 payoff_mat
-
-res <- estimate_nt_elo(N_ids,N_opts,grime_dice_matches,n_start=10)
-plot_nt_elo(res$sol,thetas,N_ids,N_opts,labels=c("Red", "Blue", "Olive", "Yellow", "Magenta"))
-
-est_thetas <- c(0,res$sol$par[1:(N_ids-1)])
-est_phis <- c(0,tail(res$sol$par,N_opts-1))
-post_estimation <- grime_dice_matches |> 
-  mutate(d_theta = est_thetas[player1]-est_thetas[player2],
-         d_phi = est_phis[hand1]-est_phis[hand2],
-         d_phi2 = atan2(sin(d_phi),cos(d_phi)),
-         exponent = -(d_theta+sinpi(d_phi2)),
-         prob = 1/(1+exp(exponent))) |>
-  group_by(hand1,hand2) |>
-  summarise(expected_payoff=mean(prob),.groups = "drop_last")
-
 est_payoff_mat <- xtabs(expected_payoff ~ hand1 + hand2, data=post_estimation)
 est_payoff_mat
 
 
-res <- estimate_nt_elo_experiement(N_ids,N_opts,grime_dice_matches,n_start=10)
-plot_nt_elo(res$sol,thetas,N_ids,N_opts,labels=c("Red", "Blue", "Olive", "Yellow", "Magenta"))
+res_nt <- estimate_nt_elo(N_ids,N_opts,grime_dice_matches,n_start = 10,
+                          theta_centering=FALSE,use_atanh=TRUE)
 
-est_thetas <- c(0,res$sol$par[1:(N_ids-1)])
-est_phis <- c(0,tail(res$sol$par,N_opts-1))
-post_estimation <- grime_dice_matches |> 
+estimates <- get_res_estimates(res_nt,N_ids,theta_centering=FALSE)
+pred_p <- get_predicted_prob(grime_dice_matches,
+                             theta=estimates$theta,phi=estimates$phi,
+                             use_atanh = TRUE)
+
+plot_nt_elo(res_nt$sol,thetas,N_ids,N_opts,theta_centering = FALSE,
+            p_true=grime_dice_matches$true_p,p_pred=pred_p,w=grime_dice_matches$result,
+            labels=c("Red", "Blue", "Olive", "Yellow", "Magenta"))
+
+est_thetas <- estimates$theta
+est_phis <- estimates$phi
+post_estimation <- grime_dice_matches |>
   mutate(d_theta = est_thetas[player1]-est_thetas[player2],
          d_phi = est_phis[hand1]-est_phis[hand2],
-         d_phi2 = atan2(sin(d_phi),cos(d_phi)),
-         exponent = -(d_theta+2*atanh(sinpi(d_phi2))),
+         d_phi2 = atan2(sinpi(d_phi), cospi(d_phi)) %% (2*pi),
+         exponent = -(2*atanh(sin(d_phi2))),
          prob = 1/(1+exp(exponent))) |>
   group_by(hand1,hand2) |>
   summarise(expected_payoff=mean(prob),.groups = "drop_last")
 
+payoff_mat
 est_payoff_mat <- xtabs(expected_payoff ~ hand1 + hand2, data=post_estimation)
 est_payoff_mat
+
 ```
 
 ## Recovering parameters
@@ -696,14 +964,15 @@ est_payoff_mat
 If the probability of winning is actually a combination of difference in abilities and advantage of the hand played, can we recover these parameters?
 
 ```{r}
-
+set.seed(1729)
 N_ids <- 100
 N_games <- 1000
-N_opts <- 5
+N_opts <-3
 
 NT_thetas <- rnorm(N_ids)
-delta_phi <- 2*pi/N_opts
-NT_phis <- seq(from=0,to=(2*pi-delta_phi),length.out=N_opts)
+delta_phi <- 2/N_opts
+NT_phis <- runif(N_opts,0,2)
+# NT_phis <- seq(from=0,to=(2-delta_phi),length.out=N_opts)
 
 NT_matches <- as.data.frame(do.call(
   rbind, 
@@ -713,26 +982,328 @@ NT_matches <- NT_matches |> rename(player1="V1",
                              player2="V2",
                              hand1 = "V3",
                              hand2 = "V4",
-                             result="V5")
+                             result="V5",
+                             true_p="V6")
 ```
 
 ```{r}
-sol <- fit_elo_model(N_ids,NT_matches)
-plot_elo(sol,NT_thetas)
+ggplot(NT_matches,aes(x=true_p,y=result,color=factor(result))) +geom_point(size=1,alpha=0.5) + theme_bw() + labs(x="True Predicted Prob",y="Result",color="Result",title = "True Sim data")
 
-res <- estimate_nt_elo(N_ids,N_opts,NT_matches,10)
-sol <- res$sol
-plot_nt_elo(sol,NT_thetas,N_ids,N_opts,labels=c("Rock","Paper","Scissors","Lizard","Spock"))
-
-res <- estimate_nt_elo_experiement(N_ids,N_opts,NT_matches,10)
-sol <- res$sol
-plot_nt_elo(sol,NT_thetas,N_ids,N_opts,labels=c("Rock","Paper","Scissors","Lizard","Spock"))
+ggplot(NT_matches,aes(x=true_p,fill=factor(result))) +geom_density(alpha=0.5) + theme_bw() + labs(x="True Predicted Prob",y="density",color="Result",title = "True Sim data")
 ```
 
-## Starcraft II 
+```{r}
+elo_sol <- fit_elo_model(N_ids,NT_matches)
+elo_pred <- get_predicted_prob(NT_matches,theta=elo_sol$par)
+plot_elo(elo_sol,NT_thetas,p_true=NT_matches$true_p,p_pred=elo_pred,w=NT_matches$result)
+
+res_nt <- estimate_nt_elo(N_ids,N_opts,NT_matches,n_start = 10,
+                          theta_centering = TRUE,
+                          use_atanh = FALSE,
+                          scale_by_sd = FALSE,
+                          ridge_penalty = TRUE)
+
+estimates <- get_res_estimates(res_nt,N_ids,theta_centering=TRUE)
+pred_p <- get_predicted_prob(NT_matches,theta=estimates$theta,phi=estimates$phi)
+
+plot_nt_elo(res_nt$sol,NT_thetas,N_ids,N_opts,theta_centering = TRUE,
+            p_true=NT_matches$true_p,p_pred=pred_p,w=NT_matches$result,
+            labels=c("Rock", "Paper", "Scissors","Spock","Lizard"))
+
+res_nt <- estimate_nt_elo(N_ids,N_opts,NT_matches,n_start = 10,
+                          theta_centering=FALSE,use_atanh=TRUE)
+
+estimates <- get_res_estimates(res_nt,N_ids,theta_centering=FALSE)
+pred_p <- get_predicted_prob(NT_matches,
+                             theta=estimates$theta,phi=estimates$phi,
+                             use_atanh = TRUE)
+
+plot_nt_elo(res_nt$sol,NT_thetas,N_ids,N_opts,theta_centering = FALSE,
+            p_true=NT_matches$true_p,p_pred=pred_p,w=NT_matches$result,
+            labels=c("Rock", "Paper", "Scissors","Spock","Lizard"))
+```
 
 ```{r}
-## Python code for getting Starcraft data
+# elo_sol  <- fit_elo_model(N_ids, NT_matches)
+# res_rps  <- estimate_nt_elo(N_ids, N_opts, NT_matches, 10)
+# res_rps_exp <- estimate_nt_elo(N_ids, N_opts, NT_matches, 10, theta_centering="fixed", use_atanh=TRUE)
+# 
+# est_thetas <- as_tibble(elo_sol$par) |> rename(elo_theta='value') |> mutate(id=row_number())
+# est_thetas$rps_theta     <- res_rps$sol$par[1:N_ids]
+# est_thetas$rps_exp_theta <- c(0, res_rps_exp$sol$par[1:(N_ids-1)])
+# est_thetas$true_theta    <- NT_thetas
+# 
+# est_phis <- as_tibble(c(1:N_opts)) |> rename(hand='value')
+# est_phis$rps_phi     <- c(0, res_rps$sol$par[(N_ids+1):(N_ids+N_opts-1)])
+# est_phis$rps_exp_phi <- c(0, res_rps_exp$sol$par[N_ids:(N_ids+N_opts-2)])
+# est_phis$true_phi    <- NT_phis
+# 
+# NT_matches_predict <- NT_matches |>
+#   left_join(est_thetas, by=join_by(player1==id)) |>
+#   left_join(est_thetas, by=join_by(player2==id)) |>
+#   left_join(est_phis,   by=join_by(hand1==hand)) |>
+#   left_join(est_phis,   by=join_by(hand2==hand)) |>
+#   mutate(elo_d_theta     = elo_theta.x - elo_theta.y,
+#          rps_d_theta     = rps_theta.x - rps_theta.y,
+#          rps_exp_d_theta = rps_exp_theta.x - rps_exp_theta.y,
+#          true_d_theta    = true_theta.x - true_theta.y,
+#          rps_d_phi       = rps_phi.x - rps_phi.y,
+#          true_d_phi      = true_phi.x - true_phi.y,
+#          rps_exp_d_phi   = rps_exp_phi.x - rps_exp_phi.y,
+#          rps_g_d_phi     = 2*sin(atan2(sinpi(rps_d_phi), cospi(rps_d_phi))),
+#          rps_exp_g_d_phi = 2*atanh(sin(atan2(sinpi(rps_exp_d_phi), cospi(rps_exp_d_phi)))),
+#          true_g_d_phi    = 2*sin(atan2(sinpi(true_d_phi), cospi(true_d_phi))),
+#          p_elo     = plogis(elo_d_theta),
+#          p_rps     = plogis(rps_d_theta + rps_g_d_phi),
+#          p_rps_exp = plogis(rps_exp_d_theta + rps_exp_g_d_phi),
+#          p_true    = plogis(true_d_theta + true_g_d_phi))
+# 
+# plot_elo(elo_sol, NT_thetas)
+# plot_nt_elo(res_rps$sol, NT_thetas, N_ids, N_opts,
+#             labels=c("Rock","Paper","Scissors","Spock","Lizard"),
+#             p_pred=NT_matches_predict$p_rps,
+#             p_true=NT_matches_predict$p_true)
+# plot_nt_elo(res_rps_exp$sol, NT_thetas, N_ids, N_opts, theta_offset=1,
+#             labels=c("Rock","Paper","Scissors","Spock","Lizard"),
+#             p_pred=NT_matches_predict$p_rps_exp,
+#             p_true=NT_matches_predict$p_true)
+```
+
+```{r}
+# ggplot(NT_matches_predict,aes(x=p_elo,fill=factor(result))) +geom_density(alpha=0.5) + theme_bw() + labs(x="ELO Predicted Prob",y="density",color="Result",title = "ELO")
+# 
+# ggplot(NT_matches_predict,aes(x=p_rps,fill=factor(result))) +geom_density(alpha=0.5) + theme_bw() + labs(x="NT-ELO Predicted Prob",y="density",color="Result",title = "NT-ELO")
+# 
+# ggplot(NT_matches_predict,aes(x=p_rps_exp,fill=factor(result))) +geom_density(alpha=0.5) + theme_bw() + labs(x="NT-Exp-ELO Predicted Prob",y="density",color="Result",title = "NT-Exp-ELO")
+```
+
+### Dice with Handicap
+
+```{r}
+dice_3 <- list(c(rep(3,5),6), #Red: 333336
+               c(rep(2,3),rep(5,3)), #Blue: 222555
+               c(1,rep(4,5))) # Olive: 144444
+
+dice_4 <- list(c(rep(0,2),rep(4,4)), #Red: 004444
+               c(rep(3,6)), #Blue: 333333
+               c(rep(1,3),rep(5,3)), # Olive: 111555
+               c(rep(2,4),rep(6,2))) # Yellow: 222266
+
+dice_5 <- list(c(rep(4,5),9), #Red: 444449
+               c(rep(2,3),rep(7,3)), #Blue: 222777
+               c(rep(0,1),rep(5,5)), # Olive: 055555
+               c(rep(3,4),rep(8,2)), # Yellow: 333388
+               c(rep(1,2),rep(6,4))) # Magenta: 116666
+
+```
+
+#### 3-dice
+
+```{r}
+N_ids <- 100
+N_games <- 1000
+N_opts <- 3
+dice_thetas <- rnorm(N_ids)
+
+dice_games <- as.data.frame(do.call(rbind,
+                      replicate(N_games,simulate_dice_rolls(dice_thetas,dice_3),
+                      simplify=FALSE)))
+
+dice_games <- dice_games |> rename(player1="V1",
+                             player2="V2",
+                             hand1 = "V3",
+                             hand2 = "V4",
+                             result="V5",
+                             true_p="V6")
+```
+
+```{r}
+elo_sol <- fit_elo_model(N_ids,dice_games)
+elo_pred <- get_predicted_prob(dice_games,theta=elo_sol$par)
+plot_elo(elo_sol,dice_thetas,p_true=dice_games$true_p,p_pred=elo_pred,w=dice_games$result)
+
+res_nt <- estimate_nt_elo(N_ids,N_opts,dice_games,n_start = 10,
+                          theta_centering = TRUE,
+                          use_atanh = FALSE,
+                          scale_by_sd = FALSE,
+                          ridge_penalty = TRUE)
+
+estimates <- get_res_estimates(res_nt,N_ids,theta_centering=TRUE)
+pred_p <- get_predicted_prob(dice_games,theta=estimates$theta,phi=estimates$phi)
+
+plot_nt_elo(res_nt$sol,dice_thetas,N_ids,N_opts,theta_centering = TRUE,
+            p_true=dice_games$true_p,p_pred=pred_p,w=dice_games$result,
+            labels=c("Red", "Blue", "Olive", "Yellow", "Magenta"))
+
+
+res_nt <- estimate_nt_elo(N_ids,N_opts,dice_games,n_start = 10,
+                          theta_centering=FALSE,use_atanh=TRUE)
+
+estimates <- get_res_estimates(res_nt,N_ids,theta_centering=FALSE)
+pred_p <- get_predicted_prob(dice_games,
+                             theta=estimates$theta,phi=estimates$phi,
+                             use_atanh = TRUE)
+
+plot_nt_elo(res_nt$sol,dice_thetas,N_ids,N_opts,theta_centering = FALSE,
+            p_true=dice_games$true_p,p_pred=pred_p,w=dice_games$result,
+            labels=c("Red", "Blue", "Olive", "Yellow", "Magenta"))
+
+```
+
+```{r}
+# elo_sol <- fit_elo_model(N_ids,dice_games)
+# plot_elo(elo_sol,dice_thetas)
+# 
+# res_rps <- estimate_nt_elo(N_ids,3,dice_games,10)
+# sol <- res_rps$sol
+# plot_nt_elo(sol,dice_thetas,N_ids,3,labels=c("Red","Blue","Olive","Yellow","Magenta"))
+# 
+# res_rps_exp <- estimate_nt_elo(N_ids,3,dice_games,10,theta_centering="fixed",use_atanh=TRUE)
+# sol <- res_rps_exp$sol
+# plot_nt_elo(sol,dice_thetas,N_ids,3,theta_offset=1,labels=c("Red","Blue","Olive","Yellow","Magenta"))
+```
+
+#### 4-dice
+
+```{r}
+N_ids <- 100
+N_games <- 1000
+N_opts<-4
+dice_thetas <- rnorm(N_ids)
+
+dice_games <- as.data.frame(do.call(rbind,
+                      replicate(N_games,simulate_dice_rolls(dice_thetas,dice_4),
+                      simplify=FALSE)))
+
+dice_games <- dice_games |> rename(player1="V1",
+                             player2="V2",
+                             hand1 = "V3",
+                             hand2 = "V4",
+                             result="V5",
+                             true_p="V6")
+```
+
+```{r}
+elo_sol <- fit_elo_model(N_ids,dice_games)
+elo_pred <- get_predicted_prob(dice_games,theta=elo_sol$par)
+plot_elo(elo_sol,dice_thetas,p_true=dice_games$true_p,p_pred=elo_pred,w=dice_games$result)
+
+res_nt <- estimate_nt_elo(N_ids,N_opts,dice_games,n_start = 10,
+                          theta_centering = TRUE,
+                          use_atanh = FALSE,
+                          scale_by_sd = FALSE,
+                          ridge_penalty = TRUE)
+
+estimates <- get_res_estimates(res_nt,N_ids,theta_centering=TRUE)
+pred_p <- get_predicted_prob(dice_games,theta=estimates$theta,phi=estimates$phi)
+
+plot_nt_elo(res_nt$sol,dice_thetas,N_ids,N_opts,theta_centering = TRUE,
+            p_true=dice_games$true_p,p_pred=pred_p,w=dice_games$result,
+            labels=c("Red", "Blue", "Olive", "Yellow", "Magenta"))
+
+
+res_nt <- estimate_nt_elo(N_ids,N_opts,dice_games,n_start = 10,
+                          theta_centering=FALSE,use_atanh=TRUE)
+
+estimates <- get_res_estimates(res_nt,N_ids,theta_centering=FALSE)
+pred_p <- get_predicted_prob(dice_games,
+                             theta=estimates$theta,phi=estimates$phi,
+                             use_atanh = TRUE)
+
+plot_nt_elo(res_nt$sol,dice_thetas,N_ids,N_opts,theta_centering = FALSE,
+            p_true=dice_games$true_p,p_pred=pred_p,w=dice_games$result,
+            labels=c("Red", "Blue", "Olive", "Yellow", "Magenta"))
+```
+
+```{r}
+# elo_sol <- fit_elo_model(N_ids,dice_games)
+# plot_elo(elo_sol,dice_thetas)
+# 
+# res_rps <- estimate_nt_elo(N_ids,4,dice_games,10)
+# sol <- res_rps$sol
+# plot_nt_elo(sol,dice_thetas,N_ids,4,labels=c("Red","Blue","Olive","Yellow","Magenta"))
+# 
+# res_rps_exp <- estimate_nt_elo(N_ids,4,dice_games,10,theta_centering="fixed",use_atanh=TRUE)
+# sol <- res_rps_exp$sol
+# plot_nt_elo(sol,dice_thetas,N_ids,4,theta_offset=1,labels=c("Red","Blue","Olive","Yellow","Magenta"))
+```
+
+#### 5-dice
+
+```{r}
+N_ids <- 100
+N_games <- 1000
+N_opts <- 5
+dice_thetas <- rnorm(N_ids)
+
+dice_games <- as.data.frame(do.call(rbind,
+                      replicate(N_games,simulate_dice_rolls(dice_thetas,dice_5),
+                      simplify=FALSE)))
+
+dice_games <- dice_games |> rename(player1="V1",
+                             player2="V2",
+                             hand1 = "V3",
+                             hand2 = "V4",
+                             result="V5",
+                             true_p="V6")
+
+```
+
+```{r}
+elo_sol <- fit_elo_model(N_ids,dice_games)
+elo_pred <- get_predicted_prob(dice_games,theta=elo_sol$par)
+plot_elo(elo_sol,dice_thetas,p_true=dice_games$true_p,p_pred=elo_pred,w=dice_games$result)
+
+res_nt <- estimate_nt_elo(N_ids,N_opts,dice_games,n_start = 10,
+                          theta_centering = TRUE,
+                          use_atanh = FALSE,
+                          scale_by_sd = FALSE,
+                          ridge_penalty = TRUE)
+
+estimates <- get_res_estimates(res_nt,N_ids,theta_centering=TRUE)
+pred_p <- get_predicted_prob(dice_games,theta=estimates$theta,phi=estimates$phi)
+
+plot_nt_elo(res_nt$sol,dice_thetas,N_ids,N_opts,theta_centering = TRUE,
+            p_true=dice_games$true_p,p_pred=pred_p,w=dice_games$result,
+            labels=c("Red", "Blue", "Olive", "Yellow", "Magenta"))
+
+
+res_nt <- estimate_nt_elo(N_ids,N_opts,dice_games,n_start = 10,
+                          theta_centering=FALSE,use_atanh=TRUE)
+
+estimates <- get_res_estimates(res_nt,N_ids,theta_centering=FALSE)
+pred_p <- get_predicted_prob(dice_games,
+                             theta=estimates$theta,phi=estimates$phi,
+                             use_atanh = TRUE)
+
+plot_nt_elo(res_nt$sol,dice_thetas,N_ids,N_opts,theta_centering = FALSE,
+            p_true=dice_games$true_p,p_pred=pred_p,w=dice_games$result,
+            labels=c("Red", "Blue", "Olive", "Yellow", "Magenta"))
+```
+
+```{r}
+# elo_sol <- fit_elo_model(N_ids,dice_games)
+# plot_elo(elo_sol,dice_thetas)
+# 
+# res_rps <- estimate_nt_elo(N_ids,5,dice_games,10)
+# sol <- res_rps$sol
+# plot_nt_elo(sol,dice_thetas,N_ids,5,labels=c("Red","Blue","Olive","Yellow","Magenta"))
+# 
+# res_rps_exp <- estimate_nt_elo(N_ids,5,dice_games,10,theta_centering="fixed",use_atanh=TRUE)
+# sol <- res_rps_exp$sol
+# plot_nt_elo(sol,dice_thetas,N_ids,5,theta_offset=1,labels=c("Red","Blue","Olive","Yellow","Magenta"))
+```
+
+## Starcraft II
+
+```{python}
+# Python code for getting Starcraft data
+# 
+# import requests
+# import numpy as np
+# import pandas as pd
+# import json
+# 
 # key = "KzTkOG5PJS1HC6uFBtt6"
 # next_url = f"/api/v1/match/?apikey={key}&format=json&limit=0&date__gte=2026-01-01&order_by=date&game=LotV"
 # api_url = f"https://aligulac.com"
@@ -763,13 +1334,13 @@ plot_nt_elo(sol,NT_thetas,N_ids,N_opts,labels=c("Rock","Paper","Scissors","Lizar
 # }
 # lotv.hand1 = lotv.hand1.map(mapping)
 # lotv.hand2 = lotv.hand2.map(mapping)
-# lotv.to_csv('~/Downloads/lotv_2026.csv',index=False)
+# # lotv.to_csv('~/Downloads/lotv_2026.csv',index=False)
 ```
 
 ```{r,eval=FALSE}
 starcraft <- read.csv("lotv_2026.csv")
 
-starcraft <- starcraft |> filter(hand1!=4,hand2!=4,hand1!=hand2) 
+starcraft <- starcraft |> filter(hand1!=4,hand2!=4,sca!=scb) 
 
 N_ids_old <- 1e6
 N_ids <- 0
@@ -803,23 +1374,130 @@ starcraft_filtered <- starcraft_filtered|> mutate(player1 = match(player1,ids),
 
 ```
 
+```{r}
+starcraft_filtered <- starcraft_filtered |> mutate(p_rt = plogis(rta-rtb),
+                                                   res_delta = sca - scb)
+ggplot(starcraft_filtered,aes(x=p_rt,y=res_delta,color=factor(result))) + geom_point() + theme_bw() + labs(x="Prob. from given rating and ELO model",y="Result",color="Result")
+
+ggplot(starcraft_filtered,aes(x=p_rt,fill=factor(result))) + geom_density(alpha=0.5) + theme_bw() + labs(x="Prob. from given rating and ELO model",y="density",fill="Result")
+
+```
+
 ```{r,eval=FALSE}
 avg_player_ratings <- rbind(starcraft_filtered |> select(player1,rta) |> group_by(player1) |> summarise(theta=mean(rta)) |> rename(player=player1),
       starcraft_filtered |> select(player2,rtb) |> group_by(player2) |> summarise(theta=mean(rtb))|>rename(player=player2)) |> group_by(player) |> summarise(theta=mean(theta))
 ```
 
 ```{r,eval=FALSE}
-res <- estimate_nt_elo(N_ids, N_opts, starcraft,15)
-sol <- res$sol
-starting_phi <- res$starting_phi
+res_nt_elo <- estimate_nt_elo(N_ids, N_opts, starcraft_filtered,15)
+sol <- res_nt_elo$sol
+plot_nt_elo(sol,avg_player_ratings$theta,N_ids,N_opts,labels=c("T", "Z", "P"))
+```
+
+```{r}
+## with sd_adjustment
+res_nt_elo_sd <- estimate_nt_elo(N_ids, N_opts, starcraft_filtered,15)
+sol <- res_nt_elo_sd$sol
 plot_nt_elo(sol,avg_player_ratings$theta,N_ids,N_opts,labels=c("T", "Z", "P"))
 ```
 
 ```{r,eval=FALSE}
-starcraft |> group_by(hand1,hand2) |> summarise(m=mean(result))
+starcraft_matchup_summary <- starcraft_filtered |> group_by(hand1,hand2) |> summarise(m=mean(result),.groups = "drop_last")
+
+xtabs(m ~ hand1 + hand2, data=starcraft_matchup_summary)
 ```
 
 ```{r,eval=FALSE}
-res <- fit_elo_model(N_ids, starcraft)
+res_elo <- fit_elo_model(N_ids, starcraft_filtered)
 plot_elo(res,avg_player_ratings$theta)
+```
+
+```{r}
+est_thetas <- as_tibble(res_elo$par) |> rename(elo_theta='value') |> mutate(id=row_number())
+est_thetas$rps_theta <- c(0,res_nt_elo$sol$par[1:(N_ids-1)])
+est_thetas$rps_theta_sd_adj <- c(0,res_nt_elo_sd$sol$par[1:(N_ids-1)])
+est_thetas$true_theta <- avg_player_ratings$theta
+  
+est_phis <- as_tibble(c(1:N_opts)) |> rename(hand='value')
+est_phis$rps_phi <- c(0,res_nt_elo$sol$par[N_ids:(N_ids + N_opts -2)])
+est_phis$rps_phi_sd_adj <- c(0,res_nt_elo_sd$sol$par[N_ids:(N_ids + N_opts -2)])
+
+starcraft_filtered_predict <- starcraft_filtered |> 
+  left_join(est_thetas,by=join_by(player1==id)) |> 
+  left_join(est_thetas,by=join_by(player2==id)) |>
+  left_join(est_phis,by=join_by(hand1==hand)) |>
+  left_join(est_phis,by=join_by(hand2==hand)) |>
+  mutate(elo_d_theta = elo_theta.x - elo_theta.y,
+         rps_d_theta = rps_theta.x - rps_theta.y,
+         rps_sd_d_theta = rps_theta_sd_adj.x - rps_theta_sd_adj.y,
+         true_d_theta = true_theta.x -true_theta.y,
+         rps_d_phi = rps_phi.x - rps_phi.y,
+         rps_sd_d_phi = rps_phi_sd_adj.x - rps_phi_sd_adj.y,
+         rps_g_d_phi = 2*sin(atan2(sinpi(rps_d_phi),cospi(rps_d_phi))),
+         rps_sd_g_d_phi = 2*sin(atan2(sinpi(rps_sd_d_phi),cospi(rps_sd_d_phi))),
+         p_elo = plogis(elo_d_theta),
+         p_rps = plogis(rps_d_theta+rps_g_d_phi),
+         p_rps_sd = plogis(rps_sd_d_theta+rps_sd_g_d_phi),
+         p_true = plogis(true_d_theta)
+         )
+```
+
+```{r}
+
+p1 <- ggplot(starcraft_filtered_predict,aes(x=p_elo,y=result,color=factor(result))) +geom_point(size=1,alpha=0.5) + theme_bw() + labs(x="ELO Predicted Prob",y="Result",color="Result",title = "ELO Model")
+
+p2 <- ggplot(starcraft_filtered_predict,aes(x=p_rps,y=result,color=factor(result))) +geom_point(size=1,alpha=0.5) + theme_bw() + labs(x="NT-ELO Predicted Prob",y="Result",color="Result",title = "NT-ELO Model")
+
+p3 <- ggplot(starcraft_filtered_predict,aes(x=p_rps_sd,y=result,color=factor(result))) +geom_point(size=1,alpha=0.5) + theme_bw() + labs(x="NT-ELO Predicted Prob",y="Result",color="Result",title = "NT-ELO Model (sd-adjusted)")
+
+p1 | p2 | p3
+
+```
+
+```{r}
+ggplot(starcraft_filtered_predict,aes(x=p_elo,fill=factor(result))) +geom_density(alpha=0.5) + theme_bw() + labs(x="ELO Predicted Prob",y="density",color="Result",title = "ELO")
+
+ggplot(starcraft_filtered_predict,aes(x=p_rps,fill=factor(result))) +geom_density(alpha=0.5) + theme_bw() + labs(x="NT-ELO Predicted Prob",y="density",color="Result",title = "NT-ELO")
+
+ggplot(starcraft_filtered_predict,aes(x=p_rps_sd,fill=factor(result))) +geom_density(alpha=0.5) + theme_bw() + labs(x="NT-ELO Predicted Prob",y="density",color="Result",title = "NT-ELO")
+
+```
+
+```{r}
+mean(abs(starcraft_filtered_predict$p_elo - starcraft_filtered_predict$result))
+mean(abs(starcraft_filtered_predict$p_rt - starcraft_filtered_predict$result))
+mean(abs(starcraft_filtered_predict$p_rps - starcraft_filtered_predict$result))
+mean(abs(starcraft_filtered_predict$p_rps_sd - starcraft_filtered_predict$result))
+mean(abs(starcraft_filtered_predict$p_true - starcraft_filtered_predict$result))
+```
+
+```{r}
+get_acc <- function(col='p_elo',t=0.5){
+  n_correct = sum((starcraft_filtered_predict[[col]] >= t)*(starcraft_filtered_predict$result) + (starcraft_filtered_predict[[col]] < t)*(1-starcraft_filtered_predict$result))
+  acc = n_correct/nrow(starcraft_filtered_predict)  
+  return(acc)
+}
+
+max_ps <- rep(0,5)
+best_ts <- rep(0,5)
+p_accs <- rep(0,5)
+for(t in seq(0.45,0.55,0.01)){
+  p_accs[1] <- get_acc('p_rt',t)
+  p_accs[2] <- get_acc('p_elo',t)
+  p_accs[3] <- get_acc('p_rps',t)
+  p_accs[4] <- get_acc('p_rps_sd',t)
+  p_accs[5] <- get_acc('p_true',t)
+  
+  for(i in c(1:5)){
+    if(p_accs[i] >= max_ps[i]){
+      max_ps[i] <- p_accs[i]
+      best_ts[i] <- t
+    }
+  }
+  
+}
+max_ps
+best_ts
+
+
 ```
