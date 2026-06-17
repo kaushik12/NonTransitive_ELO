@@ -285,9 +285,9 @@ p_theta | p_phi
 
 Investigating cases with failures
 
--   Bad starting conditions: Seems to work for a different simulation of matches with these starting params
+- Bad starting conditions: Seems to work for a different simulation of matches with these starting params
 
--   Cases we get poor Phi estimates
+- Cases we get poor Phi estimates
 
 ```{r}
 failed_fit_ids <- sapply(results, check_res)

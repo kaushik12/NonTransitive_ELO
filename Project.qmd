@@ -221,6 +221,7 @@ estimate_nt_elo <- function(N_ids, N_opts, matches, n_start = 5,
       starting_phi <- rep(0.25, N_opts - 1)
     } else if (k == 2) {
       starting_phi <- c(1:(N_opts - 1)) * 2 / N_opts
+      starting_phi <- runif(N_opts - 1, min = 0, max = 2)
     } else {
       starting_phi <- runif(N_opts - 1, min = 0, max = 2)
     }
@@ -432,7 +433,8 @@ Weird outliers in theta estimation make me believe that some ridge penalty on th
 set.seed(1729)
 N_ids <- 100
 N_games <- 1000
-N_opts <- 3 ## For rock-paper-scissors
+N_opts <- 7 ## For rock-paper-scissors
+payoff_matrix <- payoff_matrix
 rps_thetas <- rep(0,N_ids)
 
 rps_matches <- as.data.frame(do.call(rbind, replicate(N_games,simulate_rps(rps_thetas,N_opts),simplify = FALSE)))
