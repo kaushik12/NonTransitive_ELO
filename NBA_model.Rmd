@@ -1,0 +1,485 @@
+---
+title: "NBA Non Transitive Model"
+author: "Kaushik Mohan"
+date: "2026-09-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(tidyverse)
+library(Matrix)
+library(see)
+library(ggrepel)
+```
+
+NBA 2025-26 game outcome data from https://www.basketball-reference.com/leagues/NBA_2026_games.html
+
+
+```{r}
+games <- read.csv("~/Documents/PhD/Spring 26/Measurement/NonTransitiveELO/NBA_25_26.csv")
+teams <- sort(unique(c(games$Home.Neutral, games$Visitor.Neutral)))
+
+games_clean <- games |> filter(Notes != "NBA Cup") |>
+  mutate(Date = mdy(Date)) |>
+  filter(Date<="2026-04-12") |>
+  select(Home.Neutral, Visitor.Neutral, PTS.1, PTS) |> 
+  mutate(result = ifelse(PTS.1 > PTS,1,0)) |>
+  select(Home.Neutral, Visitor.Neutral, result) |>
+  rename(player1=Home.Neutral,
+         player2=Visitor.Neutral) |>
+  mutate(player1 = match(player1,teams),
+         player2 = match(player2,teams))
+
+N_ids <- N_opts <- length(teams)
+
+```
+
+
+```{r}
+season_matrix <- read.csv("~/Documents/PhD/Spring 26/Measurement/NonTransitiveELO/nba_25_26_matrix.csv") 
+season_matrix <- season_matrix |> 
+  select(-Rk) |>
+  mutate(Team = colnames(season_matrix)[2:31]) |>
+  pivot_longer(cols=2:31,values_to = "record",names_to="team2") |>
+  mutate(record = case_when(
+    record=="" ~ "0-1",
+    TRUE ~ record
+  )) |>
+  rowwise() |>
+  mutate(p = as.numeric(str_split(record,"-")[[1]])[1]/sum(as.numeric(str_split(record,"-")[[1]]))) |>
+  select(-record) |>
+  pivot_wider(names_from = team2,values_from = p)
+
+rownames(season_matrix) <- season_matrix$Team
+
+season_matrix <- season_matrix |> select(-Team) |> as.matrix()
+
+```
+
+
+
+```{r}
+games_mat_long <- games_clean |> group_by(player1, player2) |> summarize(p=mean(result),.groups="drop")
+payoff_mat <- games_mat_long |>
+  pivot_wider(names_from = player2, values_from = p, values_fill = 0) |>
+  select(-player1) |>
+  as.matrix() 
+
+payoff_mat <- payoff_mat[c(1:30),as.character(sort(as.numeric(colnames(payoff_mat))))]
+K_skew <- (payoff_mat - t(payoff_mat)) / 2
+```
+
+
+```{r}
+payoff_matrix <- function(N,eps=0) {
+  eps <- abs(eps)
+  # generate square matrix with 0s
+  
+  A <- matrix(0, nrow = N, ncol = N)
+  
+  # Fill upper triangle with payoff
+  for(i in c(1:(N-1))){
+    A[i,(i+1):N] <- rep(c(-1+eps, 1-eps), length.out = (N-i))
+  }
+  
+  # Enforce skew-symmetry for cyclic game
+  A <- (A - t(A))/2
+  
+  # Convert to Probabilities
+  pA <- (A + 0.5)
+  return(pA)
+}
+
+```
+
+
+
+```{r}
+P <- payoff_matrix(3,0.5)
+P
+round(Schur(qlogis(P))$Q,2)
+round(Schur(qlogis(P))$T,2)
+a <- round(Schur(qlogis(P))$Q,2)[1,1:2]
+b <- round(Schur(qlogis(P))$Q,2)[2,1:2]
+dp <- sum(a*b)
+norm_a <- sqrt(sum(a^2))
+norm_b <- sqrt(sum(b^2))
+acos(dp/(norm_a*norm_b))*180/pi
+
+```
+### Models
+
+```{r}
+mat_from_lt <- function(vals,n){
+  m <- matrix(0, n,n)
+  m[lower.tri(m)] <- vals
+  m <- t(m)
+  m[lower.tri(m)] <- -vals
+  m <- t(m)
+  return(m)
+}
+
+LogLik_NT_NBA <- function(params, data, N_ids, N_opts,
+                      lambda_t=0.1, lambda_k=0,
+                      theta_centering = FALSE,
+                      ridge_penalty = FALSE,
+                      home_advantage = TRUE) {
+
+  if(home_advantage){
+    offset <- 1
+  }else{
+    offset <- 0
+  }
+  if (theta_centering) {
+    theta <- params[1:N_ids]
+    theta <- theta - mean(theta)
+    phis <- params[(N_ids + 1):(length(params)-offset)]
+  } else {
+    theta <- c(0, params[1:(N_ids - 1)])
+    phis <- params[N_ids:(length(params)-offset)]
+  }
+  
+  
+  # Player skill difference
+  d_theta <- theta[data$player1] - theta[data$player2]
+
+  # Setting up the log-odds payoff matrix
+  K_mat <- mat_from_lt(phis, N_opts)
+  k_ab <- K_mat[cbind(data$player1, data$player2)]
+
+  if(home_advantage){
+    # Home-field advantage
+    d_h <- tail(params,1)  
+  }else{
+    d_h <- 0
+  }
+  
+  # Additive logit predictor
+  logit <- d_h + d_theta + k_ab 
+  p <- plogis(logit)
+  # p <- pmin(1 - 1e-6, pmax(1e-6, p))
+
+  # Negative log-likelihood with Ridge penalty on theta
+  ll <- sum(data$result * log(p) + (1 - data$result) * log(1 - p))
+  ## Lasso penalty
+  penalty <- ifelse(ridge_penalty, lambda_t * sum(theta^2) + lambda_k*sum(abs(phis)), 0)
+  neg_ll <- -ll + penalty
+
+  if (is.finite(neg_ll)) neg_ll else 1e10
+}
+
+# Estimate ELO + Non-Transitive Payoffs
+estimate_nt_elo_nba <- function(N_ids, N_opts, matches,
+                            lambda_t=0.1,
+                            lambda_k=0.1,
+                            theta_centering = TRUE,
+                            ridge_penalty = TRUE,
+                            home_advantage=TRUE) {
+
+  n_theta <- ifelse(theta_centering, N_ids, N_ids - 1)
+  n_payoff <- N_opts * (N_opts - 1) / 2
+
+  # Initialize near zero in log-odds space
+  starting_theta <- rnorm(n_theta, mean = 0, sd = 0.1)
+  starting_po <- rnorm(n_payoff, mean = 0, sd = 0.1)
+  if(home_advantage){
+    starting_home_adv <- rnorm(1, mean = 0, sd = 0.1)
+    starting_params <- c(starting_theta, starting_po, starting_home_adv)  
+  }else{
+    starting_params <- c(starting_theta, starting_po)  
+  }
+  
+
+  # Unconstrained bounds for log-odds payoffs
+  lower_bounds <- rep(-Inf, n_theta + n_payoff)
+  upper_bounds <- rep(Inf, n_theta + n_payoff)
+
+  sol <- optim(
+    par = starting_params,
+    fn = LogLik_NT_NBA,
+    data = matches,
+    N_ids = N_ids,
+    N_opts = N_opts,
+    lambda_t=lambda_t,
+    lambda_k=lambda_k,
+    theta_centering = theta_centering,
+    ridge_penalty = ridge_penalty,
+    home_advantage = home_advantage,
+    method = 'L-BFGS-B',
+    hessian = FALSE,
+    lower = lower_bounds,
+    upper = upper_bounds,
+    control = list(fnscale = 1, maxit = 1e6)
+  )
+
+  return(sol)
+}
+
+LogLikELO <- function(data, theta) {
+  d_h <- tail(theta,1)
+  p <- plogis(d_h + theta[data$player1] - theta[data$player2])
+  ll <- sum(data$result * log(p) + (1 - data$result) * log(1 - p))
+  return(ll)
+}
+
+fit_elo_model <- function(N_players,matches){
+  
+  starting_theta <- rnorm(N_players+1)
+
+  sol <- optim(
+    starting_theta,
+    LogLikELO,
+    data = matches,
+    method = 'L-BFGS-B',
+    lower = -3,
+    upper = 3,
+    control = list(fnscale = -1, maxit = 1e6)
+  )
+
+  return(sol)
+}
+```
+
+
+## Viz
+
+```{r}
+plot_heatmap <- function(mat, labels = NULL) {
+  labels <- str_split_i(labels," ",-1)
+  # Apply row labels if provided
+  if (!is.null(labels)) {
+    rownames(mat) <- make.unique(as.character(labels))
+    colnames(mat) <- make.unique(as.character(labels))
+  } else if (is.null(rownames(mat))) {
+    rownames(mat) <- paste0("Row_", seq_len(nrow(mat)))
+    colnames(mat) <- paste0("Col_", seq_len(ncol(mat)))
+  }
+  
+  # Reshape matrix into long format for ggplot
+  df_long <- as.data.frame(mat) %>%
+    mutate(Row = factor(rownames(.), levels = rev(rownames(.)))) %>%
+    pivot_longer(cols = -Row, names_to = "Column", values_to = "Value") %>%
+    mutate(Column = factor(Column, levels = colnames(mat)))
+  
+  # Build ggplot heatmap
+  ggplot(df_long, aes(x = Column, y = Row, fill = Value)) +
+    geom_tile(color = "white", linewidth = 0) +
+    # scale_fill_material(discrete = FALSE) + 
+    scale_fill_gradient2(low="#D55E00",
+                         # mid="#999999",
+                         high="#009E73",
+                         midpoint=mean(df_long$Value)
+                         ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+      panel.grid = element_blank(),
+      axis.title = element_blank()
+    ) +
+    coord_fixed()
+}
+```
+
+## Season match-up win probabilities
+
+```{r}
+plot_heatmap(season_matrix, teams)
+```
+
+## Simple ELO model (with home advantage) 
+
+```{r}
+nba_elo_model <- fit_elo_model(N_ids,games_clean)
+team_ratings <- data.frame(team=teams,elo_theta=nba_elo_model$par[1:N_ids])
+d_hf_elo <- tail(nba_elo_model$par,1)
+```
+
+
+## Non-transitive ELO model (with home advantage)
+
+### Tuning penalty param
+
+```{r,eval=FALSE}
+lambda_t <- c(0,0.1,seq(0.2,0.3,0.01),0.4,0.5,0.75,1,2,5)
+lambda_k <- c(0,0.5,seq(0.75,1.25,0.05),1.5,1.75,2,3,4,5)
+lambdas <- expand.grid(lambda_t, lambda_k)
+
+nlls <- rep(NA,nrow(lambdas))
+ks <- rep(NA,nrow(lambdas))
+
+for(i in c(1:nrow(lambdas))){
+  m <- estimate_nt_elo_nba(N_ids,N_opts,games_clean,lambda_t = lambdas$Var1[i],lambda_k = lambdas$Var2[i])
+  ## Slightly different definition of "free" parameters for BIC where I'm using just the estimated parameters after lasso and ignoring the ones that shrink to 0
+  ks[i] <- sum(round(m$par,2) != 0)
+  nlls[i] <- m$value
+}
+
+reg_stats <- data.frame(lambda_theta=lambdas$Var1,
+                        lambda_k=lambdas$Var2) |>
+  mutate(nll = nlls,
+         k = ks,
+         aic= 2*nll+2*k,
+         bic = 2*nll +k*log(nrow(games_clean)))
+
+```
+
+## AIC and BIC for different combinations of lambda
+
+```{r}
+reg_stats <- read.csv("~/Documents/PhD/Spring 26/Measurement/NonTransitiveELO/reg_stats.csv")
+ggplot(reg_stats |> filter(lambda_theta >=0.23,lambda_theta<=0.27),aes(x=lambda_k,y=aic,color=factor(lambda_theta))) + 
+  geom_line() + 
+  labs(title = "AIC") +
+  theme_bw() +
+  theme_minimal()
+
+ggplot(reg_stats |> filter(lambda_theta >=0.23,lambda_theta<=0.27),aes(x=lambda_k,y=bic,color=factor(lambda_theta))) + 
+  geom_line() + 
+  labs(title = "BIC") +
+  theme_bw() +
+  theme_minimal()
+
+```
+
+## Model fit at optimal lambdas
+
+```{r}
+nba_NT_elo_model <- estimate_nt_elo_nba(N_ids,N_opts,games_clean,lambda_t = 0.24, lambda_k = 1)
+```
+
+
+```{r}
+team_ratings <- team_ratings |> mutate(nt_elo_theta=nba_NT_elo_model$par[1:N_ids])
+n_payoff <- N_opts * (N_opts - 1) / 2
+nt_mat <- mat_from_lt(nba_NT_elo_model$par[(N_ids+1):(N_ids+n_payoff)],N_ids)
+d_hf_ntelo <- tail(nba_NT_elo_model$par,1)
+```
+
+### Non-transitive component of fit and decomposition
+
+Heavily regularized model leaves us with just one dominant non-transitive cycle between the Hawks, Bulls, and Pacers. 
+Pacers were one one of the worst teams (#29 of 30) in the league last season (injury to their main player), but won all 4 of their games against the Bulls (#22 of 30).
+Bulls on the other hand won all 3 of their games against the Hawks (#11 of 30), though they are the worse team on paper (from league standings, estimated ELO).
+Given the vast skill differential between the Hawks and Pacers (#11 vs. #29), the Hawks beat the pacers in 2 out of the 3 games played between them. 
+
+It is interesting to see this cycle as it is probably the simplest cycle that "corrects" discrepencies in the observed results not explained by the ELO model. 
+
+```{r}
+plot_heatmap(nt_mat, teams)
+sch_decomp <- Schur(nt_mat)
+T_mat <- round(sch_decomp$T,2)
+# T_mat
+n_cycles <- floor(nrow(nt_mat) / 2)
+cycle_strengths <- numeric(n_cycles)
+  for (k in 1:n_cycles) {
+    idx1 <- 2 * k - 1
+    idx2 <- 2 * k
+    cycle_strengths[k] <- abs(T_mat[idx1, idx2])
+  }
+
+ggplot() + geom_line(aes(x=c(1:n_cycles),y=cycle_strengths)) + labs(x="cycles",y="eigenvalues") + theme_bw() +  theme_minimal() 
+# round(sch_decomp$Q,2)[,1:2]
+# round(cycle_strengths^2/sum(cycle_strengths^2),2)[1]
+```
+
+
+
+```{r}
+first_cycle_locs <- data.frame(team=teams,
+                              x=round(cycle_strengths[1]*sch_decomp$Q,2)[,1],
+                              y=round(cycle_strengths[1]*sch_decomp$Q,2)[,2])
+
+first_cycle_locs$dist <- sqrt(first_cycle_locs$x^2 + first_cycle_locs$y^2)
+
+ggplot(first_cycle_locs,aes(x=x,y=y,label=team)) + 
+  geom_point(aes(size=dist),color=okabeito_colors(3),show.legend = FALSE) +
+  geom_text_repel(size = 4, max.overlaps = 25) +
+  theme_bw() +
+  theme_minimal() +
+  labs(title="Primary Non-transitive Cycle (Dominance: Clockwise)")
+  
+```
+
+This is 
+
+### LR-test of model
+
+This might be the wrong thing to do since we are comparing likelihood from the ELO model to penalized likelihood from the NT ELO model. I think the right thing to do here is to fit a model without regularization but parameterized based on what we find to be the dominant cycle from the regularization
+
+```{r}
+ELO_LR_test <- function(elo_model, nt_elo_model,nt_mat){
+  elo_logLik <- elo_model$value
+  NT_logLik <- -nt_elo_model$value
+  LR_stat <- -2*(elo_logLik - NT_logLik)
+  df <- sum(round(nt_mat[upper.tri(nt_mat)],2)!=0)
+  return(list(stat=LR_stat, df=df))
+}
+
+test <- ELO_LR_test(nba_elo_model, nba_NT_elo_model, nt_mat)
+test
+pchisq(test$stat, test$df, lower.tail = TRUE)
+```
+
+Alternatively, we could use a different statistical test to see if the predicted probabilites of matchups from the two models are different. Rank sum test?
+
+### Comparision of predicted probabilities from the two models
+
+```{r}
+games_clean <- games_clean |> mutate(p_elo = plogis(d_hf_elo + 
+                                                      nba_elo_model$par[1:N_ids][player1] - nba_elo_model$par[1:N_ids][player2]),
+                                     p_nt = plogis(d_hf_ntelo + 
+                                                     nba_NT_elo_model$par[1:N_ids][player1] - nba_NT_elo_model$par[1:N_ids][player2] +
+                                                     nt_mat[cbind(player1,player2)]))
+```
+
+
+```{r}
+ggplot(team_ratings,aes(x=elo_theta,y=nt_elo_theta)) + geom_point() + labs(title="ELO vs. NT-elo theta")
+ggplot(games_clean,aes(x=p_elo,y=p_nt,color=factor(result))) + geom_point(size=2,alpha=0.7) + labs(title="Predicted probabilities from ELO and NT-elo models")
+ggplot(games_clean, aes(x=p_elo,y=result)) + geom_smooth() + labs(title="predictd prob from ELO model vs. result")
+ggplot(games_clean, aes(x=p_nt,y=result)) + geom_smooth() + labs(title="predictd prob from NT-elo model vs. result")
+```
+
+### Comparison of estimated "Skill" rating
+
+```{r}
+team_ratings_long <- team_ratings |> pivot_longer(cols=2:3,names_to = "model",values_to = "theta")
+ggplot(team_ratings_long,aes(x=team,y=theta,color=model)) + 
+  geom_point(size=2) + 
+  coord_flip() + 
+  theme_bw() + 
+  theme_minimal() +
+  scale_color_see()
+```
+
+### Predictive performance on playoff games
+
+
+```{r}
+playoff_games <-games |> filter(Notes != "NBA Cup") |>
+  mutate(Date = mdy(Date)) |>
+  filter(Date>"2026-04-12") |>
+  select(Home.Neutral, Visitor.Neutral, PTS.1, PTS) |> 
+  mutate(result = ifelse(PTS.1 > PTS,1,0)) |>
+  select(Home.Neutral, Visitor.Neutral, result) |>
+  rename(player1=Home.Neutral,
+         player2=Visitor.Neutral) |>
+  mutate(player1 = match(player1,teams),
+         player2 = match(player2,teams))
+
+playoff_games <- playoff_games |> mutate(p_elo = plogis(d_hf_elo + 
+                                                      nba_elo_model$par[1:N_ids][player1] - nba_elo_model$par[1:N_ids][player2]),
+                                     p_nt = plogis(d_hf_ntelo + 
+                                                     nba_NT_elo_model$par[1:N_ids][player1] - nba_NT_elo_model$par[1:N_ids][player2] +
+                                                     nt_mat[cbind(player1,player2)]))
+
+playoff_games <- playoff_games |> mutate(logloss_elo = -(result*log(p_elo)+(1-result)*log(1-p_elo)),
+                                         logloss_nt = -(result*log(p_nt)+(1-result)*log(1-p_nt)))
+
+print(paste0("Log Loss (ELO): ",round(sum(playoff_games$logloss_elo),2)))
+print(paste0("Log Loss (NT): ",round(sum(playoff_games$logloss_nt),2)))
+```
+
+
